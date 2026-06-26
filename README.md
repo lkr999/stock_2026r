@@ -4,7 +4,7 @@ Caginalp & Laurent (1998) 8-pattern candlestick trading system for the Korean
 market (KOSPI/KOSDAQ), implementing the spec in
 [CANDLESTICK_TRADING_SYSTEM.md](CANDLESTICK_TRADING_SYSTEM.md).
 
-**Stack:** FastAPI (backend) + SvelteKit (frontend) + eBest REST API.
+**Stack:** Rust / axum (backend) + SvelteKit (frontend) + eBest REST API.
 
 ## What's implemented (Phase 1–2 MVP)
 
@@ -27,19 +27,21 @@ before live use.
 
 ## Quick start
 
+```bash
+./run_dev.sh        # builds the Rust backend (cargo) + starts the SvelteKit frontend
+```
+
+…or run each side manually:
+
 ### 1. Backend
 
 ```bash
 cd backend
-python3.13 -m venv .venv      # Python 3.13+ required
-.venv/bin/pip install -r requirements.txt
-cp .env.example .env          # EBEST_APP_KEY / EBEST_APP_SECRET 필수 (실데이터 전용)
-
-# 모든 데이터는 eBest API 에서만 가져옵니다 (.env 의 EBEST_* 키 필요):
-.venv/bin/python -m uvicorn app.main:app --port 8000
+# backend/.env 에 EBEST_APP_KEY / EBEST_APP_SECRET 설정 (실데이터 전용)
+cargo run --release     # http://localhost:8000  (모든 데이터는 eBest API 에서만 조회)
 ```
 
-Docs at http://localhost:8000/docs
+Health check at http://localhost:8000/api/health
 
 ### 2. Frontend
 
@@ -58,13 +60,12 @@ npm run dev        # http://localhost:5173  (proxies /api -> :8000)
 | `/trading` | Automated trading control — paper/live, live weight sliders, positions, daily P&L |
 | `/backtest` | Cost-aware backtest + walk-forward strategy preset comparison |
 
-## Tests
+## Build & check
 
 ```bash
-cd backend && .venv/bin/python -m pytest -q
+cd backend && cargo build      # compile the backend
+cd frontend && npm run check   # type-check the SvelteKit app
 ```
-
-Covers pattern detection, risk sizing/stops/limits, and cost-model arithmetic.
 
 ## 모의투자 / 실전투자 모드 선택
 
@@ -95,24 +96,33 @@ How it works:
 
 ## Requirements
 
-Python **3.13+** (uses PEP 695 `type` aliases, PEP 604 unions). Node 18+.
+Rust **1.80+** (cargo). Node **18+**.
 
 ## Architecture
 
 ```
-backend/app/
-  services/
-    timeframe.py        Timeframe enum + per-tf config + MTF groups
-    candle_fetcher.py   t8412/t8410 -> unified OHLCV (eBest 전용)
-    universe.py         KOSPI/KOSDAQ list from files/search_item.csv
-    pattern_detector.py 8 patterns + ATR/volume + strategy-based composite
-    strategy.py         StrategyConfig (mix/select) + presets
-    risk.py             RiskManager (sizing, stops, daily limit)
-    broker.py           paper/live order execution (CSPAT00601)
-    trading_engine.py   polling loop: exits-first then gated entries
-    mtf_engine.py       multi-timeframe confluence score
-    backtest_engine.py  CostModel + run_backtest + walk-forward
-  routers/              candles, patterns, signals, backtest, trading
-  main.py               app wiring + lifespan
+backend/src/
+  timeframe.rs        Timeframe enum + per-tf config + MTF groups
+  candle.rs           unified OHLCV candle + candlestick geometry
+  indicators.rs       MA / EMA / RSI / MACD / Bollinger
+  universe.rs         KOSPI/KOSDAQ list from files/search_item.csv
+  pattern.rs          8 patterns + ATR/volume + strategy-based composite
+  strategy.rs         StrategyConfig (mix/select) + presets
+  risk.rs             RiskManager (sizing, stops, daily limit)
+  broker.rs           paper/live order execution (CSPAT00601)
+  ebest.rs            eBest REST client (token + rate limit + retry)
+  candle_fetcher.rs   t8452/t8451 -> unified OHLCV (TTL cache, eBest only)
+  mtf.rs              multi-timeframe confluence score
+  backtest.rs         CostModel + run_backtest + walk-forward
+  engine.rs           polling loop: exits-first then gated entries
+  journal.rs          persistent trade journal
+  validation.rs       live-trading readiness gate (advisory)
+  state.rs            shared app state (singletons)
+  config.rs           settings from env / .env
+  routers/            candles, patterns, signals, backtest, trading, misc
+  main.rs             axum app wiring
 ```
-# stock_2006
+
+The SvelteKit frontend and the `/api/...` contract are unchanged from the prior
+FastAPI implementation; only the backend was rewritten in Rust.
+# stock_2026r
