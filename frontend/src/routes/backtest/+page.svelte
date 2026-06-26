@@ -10,6 +10,7 @@
   let result: any = null;
   let compare: any = null;
   let batch: any = null;
+  let verify: any = null;
   let loading = false;
   let error = '';
 
@@ -41,6 +42,22 @@
     } catch (e) { error = String(e); }
     loading = false;
   }
+  // 실매매-동일 조건으로 관심종목 검증 → tradeable 종목만 선별
+  async function runVerify() {
+    const shcodes = get(watchlist);
+    if (!shcodes.length) { error = '관심종목이 비어 있습니다. 대시보드에서 자동매매 종목을 먼저 선택하세요.'; return; }
+    loading = true; error = ''; verify = null;
+    try {
+      verify = await api.strategyBatch({ shcodes, tf, strategy: strategy || 'balanced' });
+    } catch (e) { error = String(e); }
+    loading = false;
+  }
+  // 검증 통과(selected) 종목만 관심종목으로 교체
+  function applySelected() {
+    if (!verify?.selected?.length) return;
+    watchlist.clear();
+    for (const code of verify.selected) watchlist.add(code);
+  }
 </script>
 
 <h1>백테스트 (거래비용 차감)</h1>
@@ -61,6 +78,9 @@
   <button class="alt" on:click={runCompare} disabled={loading}>전략 비교</button>
   <button class="batch" on:click={runBatch} disabled={loading} title="대시보드에서 선택한 자동매매 관심종목 전체를 백테스트">
     ★ 관심종목 전체 ({$watchlist.length})
+  </button>
+  <button class="verify" on:click={runVerify} disabled={loading} title="실매매와 동일한 조건(임계값·비용·ATR청산)으로 OOS 검증해 통과 종목만 선별">
+    ✓ 검증 통과 선별 ({$watchlist.length})
   </button>
 </div>
 
@@ -121,6 +141,41 @@
   </div>
 {/if}
 
+{#if verify}
+  <div class="panel">
+    <h3>실매매-동일 검증 (OOS) — {verify.count}종목 · {verify.strategy} · {verify.timeframe}</h3>
+    <p class="sub">진입 임계값·거래량/비용/손익비 게이트·ATR 손절/익절/트레일링을 그대로 적용한 결과입니다. OOS 순기대값이 양수이고 일관성·표본이 충분한 종목만 <strong>tradeable</strong>로 통과됩니다.</p>
+    <div class="metrics">
+      <div><span>검증 통과</span><strong class="pos">{verify.selected_count} / {verify.count}</strong></div>
+      <div><span>왕복비용</span><strong>{verify.round_trip_cost_pct.toFixed(3)}%</strong></div>
+      <div><span>진입 임계</span><strong>{verify.entry_threshold}</strong></div>
+    </div>
+    {#if verify.selected_count > 0}
+      <button class="apply" on:click={applySelected}>통과 {verify.selected_count}종목을 관심종목으로 적용</button>
+    {:else}
+      <p class="note">통과 종목이 없습니다. 이 전략/타임프레임은 비용을 넘는 OOS 엣지가 없다는 뜻입니다.</p>
+    {/if}
+    <table>
+      <thead><tr><th>판정</th><th>종목</th><th>코드</th><th>IS신호</th><th>IS순수익</th><th>OOS순수익</th><th>OOS일관성</th><th>OOS신호</th><th>비고</th></tr></thead>
+      <tbody>
+        {#each verify.items as it}
+          <tr class:dim={!it.ok || !it.tradeable}>
+            <td>{it.tradeable ? '✓ 통과' : '—'}</td>
+            <td><strong>{it.name || '-'}</strong></td>
+            <td class="cd">{it.shcode}</td>
+            <td>{it.ok ? it.in_sample_signals : '-'}</td>
+            <td class={it.ok && it.in_sample_avg_return >= 0 ? 'pos' : 'neg'}>{it.ok ? it.in_sample_avg_return.toFixed(2) + '%' : '-'}</td>
+            <td class={it.ok && it.oos_avg_return >= 0 ? 'pos' : 'neg'}>{it.ok ? it.oos_avg_return.toFixed(2) + '%' : '-'}</td>
+            <td>{it.ok ? (it.oos_consistency * 100).toFixed(0) + '%' : '-'}</td>
+            <td>{it.ok ? it.oos_total_signals : '-'}</td>
+            <td class="note">{it.ok ? '' : it.error}</td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  </div>
+{/if}
+
 {#if compare}
   <div class="panel">
     <h3>전략 프리셋 비교 (walk-forward OOS)</h3>
@@ -149,6 +204,8 @@
   button { background: #89b4fa; color: #1e1e2e; border: none; border-radius: 6px; padding: 8px 18px; font-weight: 600; cursor: pointer; }
   button.alt { background: #cba6f7; }
   button.batch { background: #f9e2af; }
+  button.verify { background: #a6e3a1; }
+  button.apply { background: #a6e3a1; margin-bottom: 14px; }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   .cd { color: #6c7086; font-size: 11px; }
   .note { color: #f9e2af; font-size: 11px; }

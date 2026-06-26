@@ -9,7 +9,8 @@
   <thead>
     <tr>
       <th></th><th>종목</th><th>현재가</th><th>등락</th><th>패턴</th><th>방향</th>
-      <th>신뢰도</th><th>종합</th><th>확인</th><th>기대(5봉)</th><th></th>
+      <th>신뢰도</th><th>종합</th><th>확인</th>
+      <th title="Caginalp-Laurent(1998) 미국 일봉 논문값 — 실제 측정값 아님. 실측은 백테스트 참고">참고기대(논문)</th><th></th>
     </tr>
   </thead>
   <tbody>
@@ -30,7 +31,8 @@
           {#if s.atr_normalized}<span class="b" title="몸통 ≥ ATR×0.3">ATR</span>{/if}
           {#if s.volume_confirmed}<span class="b" title="거래량 ≥ 평균×1.5">VOL</span>{/if}
         </td>
-        <td class="num {(s.expected_5 ?? 0) >= 0 ? 'up' : 'down'}">{(s.expected_5 ?? 0).toFixed(2)}%</td>
+        <td class="num ref {(s.expected_5 ?? 0) >= 0 ? 'up' : 'down'}"
+          title="논문(1998 미국 일봉) 참고값일 뿐, 이 종목/타임프레임의 실측 기대값이 아닙니다. 실측은 백테스트(전략)로 확인하세요.">{(s.expected_5 ?? 0).toFixed(2)}%*</td>
         <td><a href={`/chart/${s.shcode}`}>차트</a></td>
       </tr>
     {/each}
@@ -57,6 +59,7 @@
   .score { padding: 2px 6px; border-radius: 4px; background: #313244; }
   .score.hi { background: #a6e3a1; color: #1e1e2e; font-weight: 700; }
   .conf .b { font-size: 10px; background: #313244; padding: 1px 5px; border-radius: 8px; margin-right: 3px; }
+  .ref { opacity: 0.65; font-style: italic; }
   .empty { text-align: center; color: #6c7086; padding: 24px; }
   .star { background: none; border: none; cursor: pointer; font-size: 16px; color: #6c7086; padding: 0; }
   .star.on { color: #f9e2af; }

@@ -59,7 +59,8 @@
         <CompositeScoreBar
           confidence={p.confidence} mtfScore={p.mtf_score} mlScore={p.ml_score}
           composite={p.composite_score} volConfirmed={p.volume_confirmed} atrNorm={p.atr_normalized} />
-        <div class="exp">기대수익 5/10/25봉: {p.expected_5}% / {p.expected_10}% / {p.expected_25}%</div>
+        <div class="exp" title="Caginalp-Laurent(1998) 미국 일봉 논문 참고값입니다. 이 종목/타임프레임의 실측 기대값이 아니니, 백테스트(전략)로 확인하세요.">
+          참고기대 5/10/25봉(논문*): {p.expected_5}% / {p.expected_10}% / {p.expected_25}%</div>
       </div>
     {/each}
     {#if patterns.length === 0 && !loading}<p class="empty">감지된 패턴 없음</p>{/if}

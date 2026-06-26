@@ -1,0 +1,201 @@
+//! Strategy mixing/selection config (spec section 10-1).
+//!
+//! Six signal sources (rule / atr / volume / mtf / ml / gaf) can be toggled and
+//! weighted independently, replacing hardcoded composite weights.
+
+use serde_json::Value;
+use std::collections::HashMap;
+
+/// The six weighted signal sources contributing to the composite score.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Source {
+    Rule,
+    Atr,
+    Volume,
+    Mtf,
+    Ml,
+    Gaf,
+}
+
+impl Source {
+    /// Wire name (`"rule"`, `"atr"`, …).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Source::Rule => "rule",
+            Source::Atr => "atr",
+            Source::Volume => "volume",
+            Source::Mtf => "mtf",
+            Source::Ml => "ml",
+            Source::Gaf => "gaf",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "rule" => Source::Rule,
+            "atr" => Source::Atr,
+            "volume" => Source::Volume,
+            "mtf" => Source::Mtf,
+            "ml" => Source::Ml,
+            "gaf" => Source::Gaf,
+            _ => return None,
+        })
+    }
+    /// Iteration order for serializing weights.
+    pub fn all() -> [Source; 6] {
+        [Source::Rule, Source::Atr, Source::Volume, Source::Mtf, Source::Ml, Source::Gaf]
+    }
+}
+
+/// A tunable strategy: source weights + enabled patterns + entry gates.
+#[derive(Clone)]
+pub struct StrategyConfig {
+    pub name: String,
+    pub weights: HashMap<Source, f64>,
+    pub enabled_patterns: Vec<String>,
+    pub entry_threshold: f64,
+    pub direction: String,
+    pub require_volume_confirm: bool,
+    pub min_reward_risk: f64,
+    pub min_edge_over_cost: f64,
+}
+
+fn default_weights() -> HashMap<Source, f64> {
+    HashMap::from([
+        (Source::Rule, 0.40),
+        (Source::Atr, 0.15),
+        (Source::Volume, 0.15),
+        (Source::Mtf, 0.30),
+        (Source::Ml, 0.00),
+        (Source::Gaf, 0.00),
+    ])
+}
+
+fn default_patterns() -> Vec<String> {
+    ["three_white_soldiers", "morning_star", "bullish_engulfing", "hammer"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+impl Default for StrategyConfig {
+    fn default() -> Self {
+        Self {
+            name: "balanced".into(),
+            weights: default_weights(),
+            enabled_patterns: default_patterns(),
+            entry_threshold: 0.65,
+            direction: "long_only".into(),
+            require_volume_confirm: false,
+            min_reward_risk: 0.0,
+            min_edge_over_cost: 0.0,
+        }
+    }
+}
+
+impl StrategyConfig {
+    /// Weighted average of *computed* sources, renormalized.
+    ///
+    /// A source contributes only when its weight > 0 **and** its signal was
+    /// actually computed (`Some`). Sources not computed this scan (e.g. MTF/ML)
+    /// are excluded from the denominator too — otherwise their weight would drag
+    /// every score below the threshold.
+    pub fn composite(&self, signals: &HashMap<Source, Option<f64>>) -> f64 {
+        let active: Vec<(f64, f64)> = self
+            .weights
+            .iter()
+            .filter_map(|(s, &w)| match signals.get(s) {
+                Some(Some(v)) if w > 0.0 => Some((*v, w)),
+                _ => None,
+            })
+            .collect();
+        let total_w: f64 = active.iter().map(|(_, w)| w).sum::<f64>().max(1e-9);
+        active.iter().map(|(v, w)| v * w).sum::<f64>() / total_w
+    }
+}
+
+/// The four built-in presets (conservative / balanced / aggressive / ml_blended).
+pub fn presets() -> Vec<StrategyConfig> {
+    let w = |r, a, v, m, ml, g: f64| {
+        HashMap::from([
+            (Source::Rule, r),
+            (Source::Atr, a),
+            (Source::Volume, v),
+            (Source::Mtf, m),
+            (Source::Ml, ml),
+            (Source::Gaf, g),
+        ])
+    };
+    vec![
+        StrategyConfig {
+            name: "conservative".into(),
+            weights: w(0.35, 0.15, 0.20, 0.30, 0.0, 0.0),
+            entry_threshold: 0.75,
+            require_volume_confirm: true,
+            min_reward_risk: 1.5,
+            min_edge_over_cost: 3.0,
+            ..Default::default()
+        },
+        StrategyConfig {
+            name: "balanced".into(),
+            require_volume_confirm: true,
+            min_reward_risk: 1.3,
+            min_edge_over_cost: 2.0,
+            ..Default::default()
+        },
+        StrategyConfig {
+            name: "aggressive".into(),
+            weights: w(0.60, 0.10, 0.30, 0.0, 0.0, 0.0),
+            entry_threshold: 0.55,
+            ..Default::default()
+        },
+        StrategyConfig {
+            name: "ml_blended".into(),
+            weights: w(0.25, 0.10, 0.10, 0.20, 0.35, 0.0),
+            entry_threshold: 0.62,
+            ..Default::default()
+        },
+    ]
+}
+
+/// Look up a preset by name, defaulting to `balanced`.
+pub fn preset(name: &str) -> StrategyConfig {
+    presets()
+        .into_iter()
+        .find(|p| p.name == name)
+        .unwrap_or_else(|| presets().into_iter().find(|p| p.name == "balanced").unwrap())
+}
+
+/// Resolve a preset name, or a JSON object overriding a base preset, into a config.
+pub fn resolve(value: &Value) -> StrategyConfig {
+    match value {
+        Value::String(name) => preset(name),
+        Value::Object(map) => {
+            let base = preset(map.get("name").and_then(Value::as_str).unwrap_or("balanced"));
+            let mut weights = base.weights.clone();
+            if let Some(Value::Object(wm)) = map.get("weights") {
+                for (k, v) in wm {
+                    if let (Some(src), Some(f)) = (Source::parse(k), v.as_f64()) {
+                        weights.insert(src, f);
+                    }
+                }
+            }
+            let f = |k: &str, d: f64| map.get(k).and_then(Value::as_f64).unwrap_or(d);
+            let bo = |k: &str, d: bool| map.get(k).and_then(Value::as_bool).unwrap_or(d);
+            StrategyConfig {
+                name: map.get("name").and_then(Value::as_str).unwrap_or(&base.name).to_string(),
+                weights,
+                enabled_patterns: map
+                    .get("enabled_patterns")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .unwrap_or_else(|| base.enabled_patterns.clone()),
+                entry_threshold: f("entry_threshold", base.entry_threshold),
+                direction: map.get("direction").and_then(Value::as_str).unwrap_or(&base.direction).to_string(),
+                require_volume_confirm: bo("require_volume_confirm", base.require_volume_confirm),
+                min_reward_risk: f("min_reward_risk", base.min_reward_risk),
+                min_edge_over_cost: f("min_edge_over_cost", base.min_edge_over_cost),
+            }
+        }
+        _ => preset("balanced"),
+    }
+}

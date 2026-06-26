@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount } from 'svelte';
   import { api, type SignalItem, type EbestStatus, type EbestTestResult } from '$lib/api';
   import { selectedTimeframe, selectedStrategy } from '$lib/stores/timeframe';
   import { watchlist } from '$lib/stores/watchlist';
@@ -29,25 +29,26 @@
   let loading = false;
   let market = 'ALL';
   let error = '';
-  let timer: ReturnType<typeof setInterval>;
-  let initialized = false;
-  let refreshQueued = false;
-  let criteriaKey = '';
-  let lastCriteriaKey = '';
+  let hasScanned = false;       // 한 번이라도 수동 스캔했는지
+  let criteriaKey = '';         // 현재 설정값
+  let scannedKey = '';          // 마지막으로 스캔에 사용한 설정값
 
   // 현재가 필터 (search_item.csv 의 현재가 기준)
   let minPrice: number | undefined = 1000;
   let maxPrice: number | undefined = 100000;
   let watchlistOnly = false;
 
-  const DASHBOARD_SCAN_LIMIT = 25;
+  // 종합 점수 임계값으로 관심종목 자동 등록
+  let autoWatch = false;        // 켜면 스캔 후 조건을 만족하는 종목을 관심종목에 자동 추가
+  let autoWatchThreshold = 70;  // 종합 % 가 이 값 이상이면 자동 등록
+  let autoWatchAdded = 0;       // 직전 스캔에서 자동 등록된 종목 수
+
+  const DASHBOARD_SCAN_LIMIT = 250;
   const strategies = ['conservative', 'balanced', 'aggressive', 'ml_blended'];
 
-  async function refresh() {
-    if (loading) {
-      refreshQueued = true;
-      return;
-    }
+  // 현재 설정으로 스캔을 실행한다. 자동 트리거 없이 버튼 클릭 시에만 호출된다.
+  async function scan() {
+    if (loading) return;
     loading = true;
     error = '';
     try {
@@ -67,15 +68,27 @@
           maxPrice
         );
       }
+      scannedKey = criteriaKey;
+      hasScanned = true;
+      autoWatchAdded = autoWatch ? addToWatchlistByScore() : 0;
     } catch (e) {
       error = String(e);
     } finally {
       loading = false;
-      if (refreshQueued) {
-        refreshQueued = false;
-        await refresh();
+    }
+  }
+
+  // 종합 % 가 임계값 이상인 종목을 관심종목에 추가하고, 추가한 종목 수를 반환한다.
+  function addToWatchlistByScore(): number {
+    let added = 0;
+    for (const s of signals) {
+      const pct = Math.round(s.composite_score * 100);
+      if (pct >= autoWatchThreshold && !$watchlist.includes(s.shcode)) {
+        watchlist.add(s.shcode);
+        added++;
       }
     }
+    return added;
   }
 
   $: criteriaKey = JSON.stringify({
@@ -88,29 +101,18 @@
     codes: watchlistOnly ? $watchlist : []
   });
 
+  // 설정이 마지막 스캔 이후 바뀌었는지 — 표시된 결과가 오래됐음을 알린다.
+  $: dirty = hasScanned && criteriaKey !== scannedKey;
   $: shown = signals;
 
-  $: if (initialized && criteriaKey !== lastCriteriaKey) {
-    lastCriteriaKey = criteriaKey;
-    refresh();
-  }
-
-  onMount(() => {
-    initialized = true;
-    lastCriteriaKey = criteriaKey;
-    refresh();
-    loadEbestStatus();
-    timer = setInterval(() => {
-      if (!loading) refresh();
-    }, 30000);
-  });
-  onDestroy(() => clearInterval(timer));
+  // 자동 스캔하지 않는다 — eBest 상태만 조회하고 스캔은 사용자가 버튼으로 실행한다.
+  onMount(loadEbestStatus);
 </script>
 
 <header>
   <h1>패턴 시그널 대시보드</h1>
   <p class="sub">
-    Caginalp & Laurent (1998) 8패턴 + ATR/거래량/MTF 혼합 스코어 · 30초 자동 갱신 ·
+    Caginalp & Laurent (1998) 8패턴 + ATR/거래량/MTF 혼합 스코어 · 설정 후 <b>수동 스캔</b> ·
     <code>files/search_item.csv</code> 현재가 필터 후 최대 {DASHBOARD_SCAN_LIMIT}종목 스캔
   </p>
 </header>
@@ -189,12 +191,28 @@
     <label>현재가 최대</label>
     <input type="number" bind:value={maxPrice} step="500" min="0" />
   </div>
-  <button class="refresh" on:click={refresh} disabled={loading}>{loading ? '스캔중…' : '↻ 적용/새로고침'}</button>
+  <div class="group">
+    <label>종합≥% 자동등록</label>
+    <input type="number" bind:value={autoWatchThreshold} step="5" min="0" max="100" />
+  </div>
+  <button class="refresh" class:dirty on:click={scan} disabled={loading}>
+    {loading ? '스캔중…' : hasScanned ? '↻ 다시 스캔' : '▶ 스캔'}
+  </button>
+  <label class="chk">
+    <input type="checkbox" bind:checked={autoWatch} /> 종합≥{autoWatchThreshold}% 관심종목 자동등록
+  </label>
   <label class="chk">
     <input type="checkbox" bind:checked={watchlistOnly} /> 관심종목만 ({$watchlist.length})
   </label>
   <a class="to-trading" href="/trading">관심종목으로 자동매매 →</a>
 </div>
+
+{#if dirty}
+  <div class="hint">⚙️ 설정이 변경되었습니다 — <b>스캔</b> 버튼을 눌러 새 조건으로 조회하세요.</div>
+{/if}
+{#if autoWatch && autoWatchAdded > 0}
+  <div class="hint added">★ 종합 {autoWatchThreshold}% 이상 {autoWatchAdded}종목을 관심종목에 자동 등록했습니다.</div>
+{/if}
 
 {#if error}<div class="error">{error}</div>{/if}
 
@@ -212,6 +230,9 @@
   label { font-size: 12px; color: #9399b2; }
   select, input[type='number'] { background: #1e1e2e; color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px; padding: 5px 8px; width: 110px; }
   .refresh { background: #89b4fa; color: #1e1e2e; border: none; border-radius: 6px; padding: 8px 16px; font-weight: 600; cursor: pointer; }
+  .refresh.dirty { background: #f9e2af; box-shadow: 0 0 0 2px #f9e2af55; }
+  .hint { font-size: 13px; color: #f9e2af; background: #1f1d2e; border: 1px solid #45475a; border-radius: 6px; padding: 8px 12px; margin-bottom: 12px; }
+  .hint.added { color: #a6e3a1; }
   .chk { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #cdd6f4; }
   .to-trading { margin-left: auto; color: #a6e3a1; text-decoration: none; font-size: 13px; align-self: center; }
   .panel { background: #181825; border-radius: 10px; padding: 8px 16px; }

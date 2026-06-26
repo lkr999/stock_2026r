@@ -37,8 +37,11 @@
   let tip = { show: false, x: 0, y: 0 };
   let tipRow: { time: string; o: number; h: number; l: number; c: number; v: number; up: boolean;
     ma5?: number | null; ma20?: number | null; ma60?: number | null;
-    rsi?: number | null; macd?: number | null; sig?: number | null } | null = null;
+    rsi?: number | null; macd?: number | null; sig?: number | null;
+    trades?: TradeEvent[] } | null = null;
   let timeIndex = new Map<number, number>();
+  // 캔들 시간 → 그 봉에서 발생한 매수/매도 이벤트(툴팁용)
+  let tradesByTime = new Map<number, TradeEvent[]>();
 
   function toTimes(): number[] {
     const times: number[] = [];
@@ -71,6 +74,7 @@
   }
 
   function buildMarkers(times: number[]): any[] {
+    tradesByTime = new Map();
     if (!trades.length || !times.length) return [];
     const tMin = times[0];
     const tMax = times[times.length - 1];
@@ -85,6 +89,11 @@
         if (diff < bestDiff) { bestDiff = diff; best = t; }
       }
       if (ev.ts < tMin - 86400 || ev.ts > tMax + 86400) continue;
+
+      // 툴팁: 가장 가까운 캔들 시각에 거래를 누적(마커 충돌 보정 전 원래 시각 기준).
+      const atBar = tradesByTime.get(best) ?? [];
+      atBar.push(ev);
+      tradesByTime.set(best, atBar);
 
       let markerTs = best;
       while (seen.has(markerTs)) markerTs++;
@@ -209,6 +218,7 @@
       v: c.volume ?? 0, up: c.close >= c.open,
       ma5: indicators?.ma5?.[idx], ma20: indicators?.ma20?.[idx], ma60: indicators?.ma60?.[idx],
       rsi: indicators?.rsi14?.[idx], macd: indicators?.macd?.[idx], sig: indicators?.macd_signal?.[idx],
+      trades: tradesByTime.get(param.time as number) ?? [],
     };
     const rect = wrapEl.getBoundingClientRect();
     let x = param.point.x + 16;
@@ -299,6 +309,20 @@
         {#if tipRow.rsi != null}<span style="color:#94e2d5">RSI {tipRow.rsi.toFixed(1)}</span>{/if}
         {#if tipRow.macd != null}<span style="color:#89b4fa">MACD {tipRow.macd.toFixed(1)}</span>{/if}
       </div>
+      {#if tipRow.trades && tipRow.trades.length}
+        <div class="tt-trades">
+          {#each tipRow.trades as ev}
+            <div class="tt-trade">
+              <span class="tt-side {ev.type === 'buy' ? 'buy' : 'sell'}">{ev.type === 'buy' ? '▲ 매수' : '▼ 매도'}</span>
+              <span class="tt-qty">{ev.qty.toLocaleString()}주 @ {Math.round(ev.price).toLocaleString()}</span>
+              {#if ev.type === 'sell' && ev.pnl !== 0}
+                <span class={ev.pnl >= 0 ? 'up' : 'down'}>{ev.pnl >= 0 ? '+' : ''}{Math.round(ev.pnl).toLocaleString()}원 ({ev.pnl_pct >= 0 ? '+' : ''}{ev.pnl_pct.toFixed(1)}%)</span>
+              {/if}
+              {#if ev.reason}<span class="tt-reason">{ev.reason}</span>{/if}
+            </div>
+          {/each}
+        </div>
+      {/if}
     </div>
   {/if}
 
@@ -341,6 +365,13 @@
   .tt-grid span { color: #6c7086; }
   .tt-grid b { text-align: right; }
   .tt-ind { margin-top: 5px; display: flex; flex-direction: column; gap: 1px; font-size: 10px; font-variant-numeric: tabular-nums; }
+  .tt-trades { margin-top: 6px; padding-top: 5px; border-top: 1px solid #313244; display: flex; flex-direction: column; gap: 4px; }
+  .tt-trade { display: flex; flex-direction: column; gap: 1px; font-size: 10px; font-variant-numeric: tabular-nums; }
+  .tt-side { font-weight: 700; }
+  .tt-side.buy { color: #a6e3a1; }
+  .tt-side.sell { color: #f38ba8; }
+  .tt-qty { color: #cdd6f4; }
+  .tt-reason { color: #6c7086; font-size: 9px; }
   .up { color: #ef4444; }
   .down { color: #3b82f6; }
 </style>

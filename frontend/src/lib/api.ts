@@ -204,6 +204,10 @@ export const api = {
   },
   backtest: (body: Record<string, unknown>) => jpost<any>(`/api/backtest`, body),
   batchBacktest: (body: Record<string, unknown>) => jpost<any>(`/api/backtest/batch`, body),
+  // 실매매-동일 조건 단일 백테스트 (OOS + tradeable 판정 포함)
+  strategyBacktest: (body: Record<string, unknown>) => jpost<any>(`/api/backtest/strategy`, body),
+  // 여러 종목 일괄 검증 → tradeable 종목(selected)만 선별
+  strategyBatch: (body: Record<string, unknown>) => jpost<any>(`/api/backtest/strategy-batch`, body),
   compareStrategies: (body: Record<string, unknown>) =>
     jpost<any>(`/api/backtest/compare-strategies`, body),
   presets: () => jget<Record<string, any>>(`/api/trading/presets`),
