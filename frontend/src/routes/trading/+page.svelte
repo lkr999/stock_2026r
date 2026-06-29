@@ -732,7 +732,7 @@
 <style>
   h1 { font-size: 22px; margin: 0 0 6px; }
   .warn { background: #313244; color: #f9e2af; padding: 8px 12px; border-radius: 6px; font-size: 12px; margin-bottom: 16px; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
   .card { background: #181825; border-radius: 10px; padding: 16px; }
   .card.status { grid-column: 1 / -1; }
   h3 { margin: 0 0 14px; font-size: 15px; }

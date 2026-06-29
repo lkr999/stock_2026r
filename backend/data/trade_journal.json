@@ -76,5 +76,44 @@
     "qty": 1,
     "reason": "trailing_stop",
     "return_pct": 0.891051567239636
+  },
+  {
+    "closed_at": "2026-06-29T02:20:11.982139+00:00",
+    "code": "006370",
+    "entry": 3640.0,
+    "exit": 3650.0,
+    "mode": "paper",
+    "opened_at": "2026-06-29T01:10:32.885587+00:00",
+    "pattern": "hammer",
+    "pnl": 100.0,
+    "qty": 10,
+    "reason": "trailing_stop",
+    "return_pct": 0.27472527472527475
+  },
+  {
+    "closed_at": "2026-06-29T03:50:41.741971+00:00",
+    "code": "013890",
+    "entry": 8830.0,
+    "exit": 8840.0,
+    "mode": "paper",
+    "opened_at": "2026-06-29T02:41:27.054554+00:00",
+    "pattern": "hammer",
+    "pnl": 100.0,
+    "qty": 10,
+    "reason": "trailing_stop",
+    "return_pct": 0.11325028312570784
+  },
+  {
+    "closed_at": "2026-06-29T03:55:41.664963+00:00",
+    "code": "013360",
+    "entry": 1276.0,
+    "exit": 1284.0,
+    "mode": "paper",
+    "opened_at": "2026-06-29T01:40:16.725619+00:00",
+    "pattern": "bullish_engulfing",
+    "pnl": 80.0,
+    "qty": 10,
+    "reason": "trailing_stop",
+    "return_pct": 0.6269592476489028
   }
 ]

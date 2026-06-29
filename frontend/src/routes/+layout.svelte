@@ -34,5 +34,5 @@
   .links { display: flex; gap: 8px; }
   .links a { color: #bac2de; text-decoration: none; padding: 6px 14px; border-radius: 6px; font-size: 14px; }
   .links a.active { background: #313244; color: #89b4fa; font-weight: 600; }
-  main { max-width: 1200px; margin: 0 auto; padding: 24px; }
+  main { max-width: none; margin: 0; padding: 24px; }
 </style>
