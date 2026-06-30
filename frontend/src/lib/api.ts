@@ -64,6 +64,12 @@ export interface Indicators {
   macd: (number | null)[];
   macd_signal: (number | null)[];
   macd_hist: (number | null)[];
+  // 단타 오버레이: 세션 VWAP + 개장 레인지 박스 + 단기 EMA
+  vwap: (number | null)[];
+  or_high: (number | null)[];
+  or_low: (number | null)[];
+  ema9: (number | null)[];
+  ema20: (number | null)[];
 }
 
 export interface IndicatorsResponse {
@@ -80,6 +86,8 @@ export interface TradeEvent {
   code: string;
   name: string;
   type: 'buy' | 'sell';
+  side?: 'long' | 'short';   // 롱/숏 (숏은 페이퍼 시뮬레이션)
+  action?: 'open' | 'close'; // 진입/청산
   price: number;
   qty: number;
   pnl: number;
@@ -202,14 +210,10 @@ export const api = {
     if (params.limit != null) u.set('limit', String(params.limit));
     return jget<{ total: number; items: UniverseItem[] }>(`/api/universe?${u.toString()}`);
   },
-  backtest: (body: Record<string, unknown>) => jpost<any>(`/api/backtest`, body),
+  // 관심종목 전체 × 전략 프리셋(트레이더) 매트릭스 검증 + 베스트 전략 판정
+  strategyMatrix: (body: Record<string, unknown>) => jpost<any>(`/api/backtest/strategy-matrix`, body),
+  // 관심종목 패턴별 통계(참고용)
   batchBacktest: (body: Record<string, unknown>) => jpost<any>(`/api/backtest/batch`, body),
-  // 실매매-동일 조건 단일 백테스트 (OOS + tradeable 판정 포함)
-  strategyBacktest: (body: Record<string, unknown>) => jpost<any>(`/api/backtest/strategy`, body),
-  // 여러 종목 일괄 검증 → tradeable 종목(selected)만 선별
-  strategyBatch: (body: Record<string, unknown>) => jpost<any>(`/api/backtest/strategy-batch`, body),
-  compareStrategies: (body: Record<string, unknown>) =>
-    jpost<any>(`/api/backtest/compare-strategies`, body),
   presets: () => jget<Record<string, any>>(`/api/trading/presets`),
   tradingStart: (body: Record<string, unknown>, force = false) =>
     jpost<any>(`/api/trading/start?force=${force}`, body),

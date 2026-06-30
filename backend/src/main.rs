@@ -17,6 +17,7 @@ mod mtf;
 mod pattern;
 mod risk;
 mod routers;
+mod session;
 mod state;
 mod strategy;
 mod timeframe;

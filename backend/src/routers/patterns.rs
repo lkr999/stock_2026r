@@ -1,7 +1,9 @@
 //! Pattern detection endpoints (single symbol, multi-scan, optional MTF).
 
+use crate::indicators::ema_values;
 use crate::mtf::MtfEngine;
-use crate::pattern::apply_strategy;
+use crate::pattern::{apply_strategy, detect_setups, ALL_PATTERNS, SETUP_PATTERNS};
+use crate::session::SessionContext;
 use crate::state::AppState;
 use crate::strategy::{self};
 use crate::timeframe::Timeframe;
@@ -49,8 +51,19 @@ async fn get_patterns(State(st): State<AppState>, Path(shcode): Path<String>, Qu
             r.mtf_score = engine.score(&token, &shcode, tf, &r.pattern_type).await;
             apply_strategy(r, &cfg, true, false, false);
         }
-        results.sort_by(|a, b| b.composite_score.partial_cmp(&a.composite_score).unwrap_or(std::cmp::Ordering::Equal));
     }
+    // Merge context setups (VWAP / ORB / EMA pullback) for the latest closed bar.
+    if candles.len() >= 3 {
+        let ctx = SessionContext::for_tf(&candles, tf);
+        let ema9 = ema_values(&candles, 9);
+        let ema20 = ema_values(&candles, 20);
+        let mut setups = detect_setups(&candles, candles.len() - 1, &ctx, &ema9, &ema20, &cfg.enabled_patterns, cfg.allows_short());
+        for s in &mut setups {
+            apply_strategy(s, &cfg, false, false, false);
+        }
+        results.append(&mut setups);
+    }
+    results.sort_by(|a, b| b.composite_score.partial_cmp(&a.composite_score).unwrap_or(std::cmp::Ordering::Equal));
     Ok(Json(json!({
         "shcode": shcode, "name": name_for(&shcode), "timeframe": q.tf, "patterns": results,
     })))
@@ -76,9 +89,18 @@ async fn scan_many(State(st): State<AppState>, Json(body): Json<Value>) -> ApiRe
     Ok(Json(json!(out)))
 }
 
+/// `GET /api/patterns/catalog` — all detectable pattern + setup names.
+async fn pattern_catalog() -> ApiResult {
+    Ok(Json(json!({
+        "candlestick": ALL_PATTERNS,
+        "setups": SETUP_PATTERNS,
+    })))
+}
+
 /// Pattern routes.
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/api/patterns/catalog", get(pattern_catalog))
         .route("/api/patterns/scan", post(scan_many))
         .route("/api/patterns/:shcode", get(get_patterns))
 }

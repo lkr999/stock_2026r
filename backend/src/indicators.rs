@@ -4,6 +4,8 @@
 //! the warmup period so the frontend can plot them index-by-index.
 
 use crate::candle::Candle;
+use crate::session::SessionContext;
+use crate::timeframe::Timeframe;
 use serde::Serialize;
 
 type Series = Vec<Option<f64>>;
@@ -43,6 +45,21 @@ fn ema_array(values: &[f64], period: usize) -> Vec<f64> {
 
 fn clean(a: &[f64]) -> Series {
     a.iter().map(|&v| if v.is_nan() { None } else { Some(v) }).collect()
+}
+
+/// EMA over `period` closes, aligned to the candles (None during warmup).
+pub fn ema(candles: &[Candle], period: usize) -> Series {
+    clean(&ema_array(&closes(candles), period))
+}
+
+/// Raw EMA array over `period` closes (`NaN` during warmup) — for setup logic.
+pub fn ema_values(candles: &[Candle], period: usize) -> Vec<f64> {
+    ema_array(&closes(candles), period)
+}
+
+/// Map a `f64` series (NaN = no value) to the aligned `Option` series.
+fn from_raw(a: &[f64]) -> Series {
+    a.iter().map(|&v| if v.is_finite() { Some(v) } else { None }).collect()
 }
 
 /// Wilder-smoothed RSI over `period` closes.
@@ -122,12 +139,19 @@ pub struct Indicators {
     pub macd: Series,
     pub macd_signal: Series,
     pub macd_hist: Series,
+    // Day-trading overlays (단타): session VWAP + opening-range box + fast EMAs.
+    pub vwap: Series,
+    pub or_high: Series,
+    pub or_low: Series,
+    pub ema9: Series,
+    pub ema20: Series,
 }
 
 /// Compute every indicator the frontend chart needs in one pass.
-pub fn compute_all(candles: &[Candle]) -> Indicators {
+pub fn compute_all(candles: &[Candle], tf: Timeframe) -> Indicators {
     let (bb_mid, bb_upper, bb_lower) = bollinger(candles, 20, 2.0);
     let (macd_line, macd_signal, macd_hist) = macd(candles, 12, 26, 9);
+    let ctx = SessionContext::for_tf(candles, tf);
     Indicators {
         ma5: sma(candles, 5),
         ma20: sma(candles, 20),
@@ -139,5 +163,10 @@ pub fn compute_all(candles: &[Candle]) -> Indicators {
         macd: macd_line,
         macd_signal,
         macd_hist,
+        vwap: from_raw(&ctx.vwap),
+        or_high: from_raw(&ctx.or_high),
+        or_low: from_raw(&ctx.or_low),
+        ema9: ema(candles, 9),
+        ema20: ema(candles, 20),
     }
 }

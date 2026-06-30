@@ -35,7 +35,7 @@ struct SignalsQuery {
     max_price: Option<f64>,
 }
 fn d_market() -> String { "ALL".into() }
-fn d_tf() -> String { "5m".into() }
+fn d_tf() -> String { "1m".into() }
 fn d_strategy() -> String { "balanced".into() }
 fn d_min_conf() -> f64 { 0.6 }
 fn d_limit() -> usize { 30 }
@@ -106,7 +106,7 @@ async fn scan_watchlist(State(st): State<AppState>, Json(body): Json<Value>) -> 
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default();
-    let tf = Timeframe::parse(body.get("tf").and_then(Value::as_str).unwrap_or("5m"))
+    let tf = Timeframe::parse(body.get("tf").and_then(Value::as_str).unwrap_or("1m"))
         .ok_or((StatusCode::BAD_REQUEST, "invalid timeframe".into()))?;
     let cfg = strategy::resolve(body.get("strategy").unwrap_or(&json!("balanced")));
     let min_conf = body.get("min_conf").and_then(Value::as_f64).unwrap_or(0.6);

@@ -3,6 +3,7 @@
   import { get } from 'svelte/store';
   import { api, type ReadinessReport, type Timeframe, type TradeEvent, type TradeStats } from '$lib/api';
   import { watchlist } from '$lib/stores/watchlist';
+  import { symbolStrategies } from '$lib/stores/symbolStrategies';
   import { loadTradingSettings, saveTradingSettings } from '$lib/stores/tradingSettings';
   import ReadinessPanel from '$lib/components/ReadinessPanel.svelte';
   import ActiveTradeCharts from '$lib/components/ActiveTradeCharts.svelte';
@@ -216,8 +217,13 @@
     }
     try {
       const wl = watchlistText.split(',').map((s: string) => s.trim()).filter(Boolean);
+      // 대시보드의 백테스트 선정에서 배정된 종목별 전략을 함께 전달 (배정 없는 종목은 전역 전략 사용).
+      const assigned = get(symbolStrategies);
+      const symMap: Record<string, string> = {};
+      for (const c of wl) if (assigned[c]) symMap[c] = assigned[c];
       const resStart = await api.tradingStart({
         mode, strategy: { name: strategy, weights, entry_threshold: entryThreshold },
+        symbol_strategies: symMap,
         watchlist: wl, tf, poll_sec: pollSec, ignore_market_hours: ignoreHours,
         order: {
           order_type: orderType,
@@ -287,6 +293,7 @@
   // 실행 중인 엔진 설정 — status가 우선, 없으면 폼의 현재 입력값으로 폴백
   $: cfgRisk = status.risk ?? null;
   $: cfgOrder = status.order ?? null;
+  $: symStratEntries = Object.entries((status.symbol_strategies ?? {}) as Record<string, { strategy: string; tf: string }>);
   $: cfgWeights = (status.weights ?? weights) as Record<string, number>;
   $: activeWeights = sources
     .map((s) => [s, cfgWeights[s] ?? 0] as [string, number])
@@ -504,6 +511,14 @@
                 <span class="sub-note">+ 보유 {extraHeldCodes.join(', ')} (워치리스트 외 보유분도 계속 모니터링)</span>
               {/if}
             </dd></div>
+            {#if symStratEntries.length}
+              <div class="wide"><dt>종목별 전략</dt><dd class="sym-strats">
+                {#each symStratEntries as [code, v]}
+                  <span class="sym-chip">{code} → <b>{v.strategy}</b> <em>{v.tf}</em></span>
+                {/each}
+                <span class="sub-note">배정 없는 종목은 전역 전략({status.strategy ?? strategy}) 적용</span>
+              </dd></div>
+            {/if}
           </dl>
         </div>
 
@@ -790,6 +805,10 @@
   .num.buy { color: #cdd6f4; font-weight: 600; }
   .sig { color: #a6e3a1; font-size: 11px; }
   .sub-note { font-size: 11px; color: #6c7086; font-weight: 400; }
+  .sym-strats { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .sym-chip { background: #1e1e2e; border: 1px solid #313244; border-radius: 10px; padding: 2px 8px; font-size: 12px; }
+  .sym-chip b { color: #cba6f7; }
+  .sym-chip em { color: #6c7086; font-style: normal; font-size: 11px; }
   .detail { color: #bac2de; font-size: 11px; }
   .phase {
     display: inline-block; padding: 2px 8px; border-radius: 10px;

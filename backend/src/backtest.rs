@@ -1,8 +1,10 @@
 //! Cost-aware, look-ahead-safe backtester + walk-forward (spec sections 6-3, 11-1).
 
 use crate::candle::Candle;
-use crate::pattern::{compute_atr, PatternDetector};
+use crate::indicators::ema_values;
+use crate::pattern::{apply_strategy, compute_atr, detect_setups, PatternDetector, PatternResult};
 use crate::risk::RiskConfig;
+use crate::session::SessionContext;
 use crate::strategy::StrategyConfig;
 use crate::timeframe::Timeframe;
 use serde_json::{json, Value};
@@ -148,28 +150,41 @@ pub fn run_strategy_backtest(
         0.0
     };
     let n = candles.len();
+    // Session-anchored context for VWAP/ORB/EMA setups, precomputed once.
+    let ctx = SessionContext::for_tf(candles, tf);
+    let ema9 = ema_values(candles, 9);
+    let ema20 = ema_values(candles, 20);
     let mut returns: Vec<f64> = vec![];
     let mut i = 0;
     while i + 1 < n {
+        // Candidate pool = windowed candlestick patterns + context setups.
         let start = i.saturating_sub(40);
         let window = &candles[start..=i];
-        if window.len() < 13 {
+        let mut cands: Vec<PatternResult> =
+            if window.len() >= 13 { detector.scan(window, tf, 0.0, true, cfg, 1) } else { vec![] };
+        let mut setups = detect_setups(candles, i, &ctx, &ema9, &ema20, &cfg.enabled_patterns, cfg.allows_short());
+        for s in &mut setups {
+            apply_strategy(s, cfg, false, false, false);
+        }
+        cands.append(&mut setups);
+
+        let best = cands
+            .into_iter()
+            .filter(|r| {
+                cfg.enabled_patterns.contains(&r.pattern_name)
+                    && r.composite_score >= cfg.entry_threshold
+                    && (!cfg.require_volume_confirm || r.volume_confirmed)
+                    && ((r.pattern_type == "bullish" && cfg.allows_long())
+                        || (r.pattern_type == "bearish" && cfg.allows_short()))
+            })
+            .max_by(|a, b| a.composite_score.partial_cmp(&b.composite_score).unwrap_or(std::cmp::Ordering::Equal));
+        let Some(top) = best else {
             i += 1;
             continue;
-        }
-        let found = detector.scan(window, tf, 0.0, true, cfg, 1);
-        let has_cand = found.iter().any(|r| {
-            cfg.enabled_patterns.contains(&r.pattern_name)
-                && r.pattern_type == "bullish"
-                && r.composite_score >= cfg.entry_threshold
-                && (!cfg.require_volume_confirm || r.volume_confirmed)
-        });
-        if !has_cand {
-            i += 1;
-            continue;
-        }
+        };
+        let is_short = top.pattern_type == "bearish";
         let entry = candles[i + 1].open;
-        let atr = compute_atr(window, 14);
+        let atr = compute_atr(&candles[..=i], 14);
         if entry <= 0.0 || atr <= 0.0 {
             i += 1;
             continue;
@@ -184,32 +199,59 @@ pub fn run_strategy_backtest(
             i += 1;
             continue;
         }
-        let stop = entry - atr * risk.stop_loss_atr_mult;
-        let target = entry + atr * risk.take_profit_atr_mult;
-        let mut peak = entry;
+        // Direction-aware stop/target/trailing (shorts mirror longs).
+        let (stop, target) = if is_short {
+            (entry + atr * risk.stop_loss_atr_mult, entry - atr * risk.take_profit_atr_mult)
+        } else {
+            (entry - atr * risk.stop_loss_atr_mult, entry + atr * risk.take_profit_atr_mult)
+        };
+        let mut peak = entry; // best excursion: high for longs, low for shorts
         let last_idx = (i + 1 + max_hold_bars).min(n - 1);
         let (mut exit_price, mut exit_idx) = (candles[last_idx].close, last_idx);
         for j in (i + 1)..(i + 1 + max_hold_bars).min(n) {
             let c = candles[j].close;
-            peak = peak.max(c);
-            let trail = peak - atr * risk.trailing_stop_atr;
-            if c <= stop {
-                exit_price = stop;
-                exit_idx = j;
-                break;
-            }
-            if c >= target {
-                exit_price = target;
-                exit_idx = j;
-                break;
-            }
-            if c <= trail && c > entry {
-                exit_price = c;
-                exit_idx = j;
-                break;
+            if is_short {
+                peak = peak.min(c);
+                let trail = peak + atr * risk.trailing_stop_atr;
+                if c >= stop {
+                    exit_price = stop;
+                    exit_idx = j;
+                    break;
+                }
+                if c <= target {
+                    exit_price = target;
+                    exit_idx = j;
+                    break;
+                }
+                if c >= trail && c < entry {
+                    exit_price = c;
+                    exit_idx = j;
+                    break;
+                }
+            } else {
+                peak = peak.max(c);
+                let trail = peak - atr * risk.trailing_stop_atr;
+                if c <= stop {
+                    exit_price = stop;
+                    exit_idx = j;
+                    break;
+                }
+                if c >= target {
+                    exit_price = target;
+                    exit_idx = j;
+                    break;
+                }
+                if c <= trail && c > entry {
+                    exit_price = c;
+                    exit_idx = j;
+                    break;
+                }
             }
         }
-        let gross = (exit_price - entry) / entry * 100.0;
+        let mut gross = (exit_price - entry) / entry * 100.0;
+        if is_short {
+            gross = -gross;
+        }
         returns.push(gross - rt_cost);
         i = exit_idx + 1; // resume scanning after the exit (no overlapping positions)
     }

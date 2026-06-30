@@ -15,9 +15,19 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 type ApiResult = Result<Json<Value>, (StatusCode, String)>;
+
+/// Parse per-symbol strategy overrides from the request body.
+/// `{ "005930": "vwap_scalp", "000660": { "name": "balanced", ... } }`
+fn symbol_strategies_of(body: &Value) -> HashMap<String, StrategyConfig> {
+    body.get("symbol_strategies")
+        .and_then(Value::as_object)
+        .map(|m| m.iter().map(|(code, v)| (code.clone(), strategy::resolve(v))).collect())
+        .unwrap_or_default()
+}
 
 /// Readiness thresholds from settings.
 fn criteria(s: &Settings) -> ReadinessCriteria {
@@ -122,6 +132,7 @@ async fn list_presets() -> ApiResult {
         out.insert(cfg.name.clone(), json!({
             "name": cfg.name, "weights": weights, "enabled_patterns": cfg.enabled_patterns,
             "entry_threshold": cfg.entry_threshold, "direction": cfg.direction,
+            "recommended_tf": cfg.recommended_tf,
         }));
     }
     Ok(Json(Value::Object(out)))
@@ -192,6 +203,7 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
     let readiness_report = evaluate(&st.journal, &criteria(settings));
 
     let cfg = strategy::resolve(body.get("strategy").unwrap_or(&json!(settings.trading_default_strategy)));
+    let symbol_strats = symbol_strategies_of(&body);
     let mut watchlist: Vec<String> = body
         .get("watchlist")
         .and_then(Value::as_array)
@@ -200,7 +212,7 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
     if watchlist.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "watchlist required".into()));
     }
-    let tf = Timeframe::parse(body.get("tf").and_then(Value::as_str).unwrap_or("5m")).unwrap_or(Timeframe::M5);
+    let tf = Timeframe::parse(body.get("tf").and_then(Value::as_str).unwrap_or("1m")).unwrap_or(Timeframe::M1);
     let poll_sec = body.get("poll_sec").and_then(Value::as_u64).unwrap_or(60);
     let risk_cfg = risk_config(&body, settings);
 
@@ -232,7 +244,7 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
                     format!("이미 {} 모드로 실행 중입니다. 모드를 바꾸려면 먼저 중지하세요.", engine.mode().as_str())));
             }
             engine
-                .reconfigure(cfg, watchlist, tf, ignore_hours, order_cfg, risk_cfg, settings.trading_paper_seed)
+                .reconfigure(cfg, symbol_strats, watchlist, tf, ignore_hours, order_cfg, risk_cfg, settings.trading_paper_seed)
                 .await;
             return Ok(Json(json!({
                 "ok": true, "mode": mode.as_str(), "resumed": true, "reconfigured": true,
@@ -249,7 +261,7 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
     if reuse {
         engine = guard.clone().unwrap();
         engine
-            .reconfigure(cfg, watchlist, tf, ignore_hours, order_cfg, risk_cfg, settings.trading_paper_seed)
+            .reconfigure(cfg, symbol_strats, watchlist, tf, ignore_hours, order_cfg, risk_cfg, settings.trading_paper_seed)
             .await;
         engine.start(poll_sec, true).await;
     } else {
@@ -260,6 +272,7 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
             st.detector.clone(),
             broker,
             cfg,
+            symbol_strats,
             RiskManager::new(risk_cfg),
             watchlist,
             tf,

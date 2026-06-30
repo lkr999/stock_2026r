@@ -1,10 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type SignalItem, type EbestStatus, type EbestTestResult } from '$lib/api';
-  import { selectedTimeframe, selectedStrategy } from '$lib/stores/timeframe';
+  import { api, type UniverseItem, type EbestStatus, type EbestTestResult } from '$lib/api';
   import { watchlist } from '$lib/stores/watchlist';
-  import TimeframeSelector from '$lib/components/TimeframeSelector.svelte';
-  import SignalTable from '$lib/components/SignalTable.svelte';
+  import { symbolStrategies } from '$lib/stores/symbolStrategies';
   import WatchlistPicker from '$lib/components/WatchlistPicker.svelte';
 
   // eBest API 통신 상태/테스트
@@ -25,95 +23,117 @@
     loadEbestStatus();
   }
 
-  let signals: SignalItem[] = [];
-  let loading = false;
-  let market = 'ALL';
   let error = '';
-  let hasScanned = false;       // 한 번이라도 수동 스캔했는지
-  let criteriaKey = '';         // 현재 설정값
-  let scannedKey = '';          // 마지막으로 스캔에 사용한 설정값
 
-  // 현재가 필터 (search_item.csv 의 현재가 기준)
+  // ── 1단계: 가격 필터 스캔 (패턴 감지 없이, 현재가/시장 필터만으로 후보 선별) ──
+  let market = 'ALL';
   let minPrice: number | undefined = 1000;
   let maxPrice: number | undefined = 100000;
-  let watchlistOnly = false;
+  let candidateLimit = 60;          // 백테스트 대상 상한 (eBest 호출 한도 고려)
+  let candidates: UniverseItem[] = [];
+  let scanning = false;
+  let scanned = false;
 
-  // 종합 점수 임계값으로 관심종목 자동 등록
-  let autoWatch = false;        // 켜면 스캔 후 조건을 만족하는 종목을 관심종목에 자동 추가
-  let autoWatchThreshold = 70;  // 종합 % 가 이 값 이상이면 자동 등록
-  let autoWatchAdded = 0;       // 직전 스캔에서 자동 등록된 종목 수
+  // ── 2단계: 후보 전체 백테스트 (모든 전략 × 모든 종목) ──
+  let btTf = 'auto';                // 'auto' = 전략별 권장 TF
+  let btHold = 25;
+  let matrix: any = null;
+  let backtesting = false;
 
-  const DASHBOARD_SCAN_LIMIT = 250;
-  const strategies = ['conservative', 'balanced', 'aggressive', 'ml_blended'];
+  // ── 3단계: OOS 순수익 기준 관심종목 선정 + 종목별 베스트 전략 배정 ──
+  let oosMinReturn = 0;             // 최소 OOS 순수익(%)
+  let oosMaxPick = 15;             // 최대 선정 종목 수
+  let oosSelectMsg = '';
 
-  // 현재 설정으로 스캔을 실행한다. 자동 트리거 없이 버튼 클릭 시에만 호출된다.
+  // 1단계: 현재가/시장 필터로 후보 종목 목록만 가져온다 (패턴 스캔 아님).
   async function scan() {
-    if (loading) return;
-    loading = true;
-    error = '';
+    if (scanning) return;
+    scanning = true; error = ''; matrix = null; oosSelectMsg = '';
     try {
-      if (watchlistOnly) {
-        const codes = [...$watchlist];
-        signals = codes.length
-          ? await api.watchlistSignals(codes, $selectedTimeframe, $selectedStrategy, 0.5)
-          : [];
-      } else {
-        signals = await api.signals(
-          market,
-          $selectedTimeframe,
-          $selectedStrategy,
-          0.5,
-          DASHBOARD_SCAN_LIMIT,
-          minPrice,
-          maxPrice
-        );
-      }
-      scannedKey = criteriaKey;
-      hasScanned = true;
-      autoWatchAdded = autoWatch ? addToWatchlistByScore() : 0;
+      const r = await api.universe({ market, minPrice, maxPrice, limit: candidateLimit });
+      candidates = r.items ?? [];
+      scanned = true;
     } catch (e) {
       error = String(e);
     } finally {
-      loading = false;
+      scanning = false;
     }
   }
 
-  // 종합 % 가 임계값 이상인 종목을 관심종목에 추가하고, 추가한 종목 수를 반환한다.
-  function addToWatchlistByScore(): number {
-    let added = 0;
-    for (const s of signals) {
-      const pct = Math.round(s.composite_score * 100);
-      if (pct >= autoWatchThreshold && !$watchlist.includes(s.shcode)) {
-        watchlist.add(s.shcode);
-        added++;
+  // 2단계: 가격 필터된 후보 전체를 모든 전략으로 OOS 백테스트.
+  async function runBacktest() {
+    if (backtesting) return;
+    const codes = candidates.map((c) => c.code);
+    if (!codes.length) { error = '먼저 ▶ 스캔으로 가격 필터된 후보를 만드세요.'; return; }
+    backtesting = true; error = ''; matrix = null; oosSelectMsg = '';
+    try {
+      matrix = await api.strategyMatrix({ shcodes: codes, tf: btTf, max_hold_bars: btHold });
+    } catch (e) {
+      error = String(e);
+    } finally {
+      backtesting = false;
+    }
+  }
+
+  // 3단계: 백테스트 결과에서 종목마다 OOS 순수익이 가장 높은(통과한) 전략을 골라
+  // 관심종목으로 선정하고 종목별 전략을 배정한다.
+  function selectFromMatrix() {
+    if (!matrix?.items?.length) { error = '먼저 ▶ 백테스트를 실행하세요.'; return; }
+    // 종목마다 실제 거래(OOS 신호>0)가 있은 전략 중 OOS 순수익 1위를 고르고,
+    // 그 값이 임계 이상인 종목만 선정한다. (tradeable 엄격 게이트는 요구하지 않음)
+    const bySymbol = new Map<string, { strategy: string; oos: number; tf: string }>();
+    for (const it of matrix.items) {
+      if (!it.ok || (it.oos_total_signals ?? 0) <= 0) continue;
+      const cur = bySymbol.get(it.shcode);
+      if (!cur || it.oos_avg_return > cur.oos)
+        bySymbol.set(it.shcode, { strategy: it.strategy, oos: it.oos_avg_return, tf: it.tf });
+    }
+    const picks = [...bySymbol.entries()]
+      .filter(([, v]) => v.oos >= oosMinReturn)
+      .sort((a, b) => b[1].oos - a[1].oos)
+      .slice(0, oosMaxPick);
+    if (!picks.length) {
+      oosSelectMsg = `통과(OOS 순수익 ≥ ${oosMinReturn}%) 종목이 없습니다. 임계를 낮추거나 후보를 늘려보세요.`;
+      return;
+    }
+    watchlist.clear();
+    const map: Record<string, string> = {};
+    for (const [code, v] of picks) { watchlist.add(code); map[code] = v.strategy; }
+    symbolStrategies.replace(map);
+    const preview = picks.slice(0, 6).map(([c, v]) => `${c}→${v.strategy}(${v.oos.toFixed(2)}%)`).join(', ');
+    oosSelectMsg = `${picks.length}종목 선정 · 종목별 OOS 순수익 최고 전략 배정 — ${preview}${picks.length > 6 ? ' …' : ''}`;
+  }
+
+  // 백테스트 결과를 종목(행) × 전략(열) 격자로 변환 — 각 셀은 OOS 순수익(%).
+  type Row = { code: string; name: string; cells: Record<string, any>; best: string | null; bestOos: number };
+  function buildRows(m: any): Row[] {
+    if (!m?.items?.length) return [];
+    const bySym = new Map<string, Row>();
+    for (const it of m.items) {
+      let row = bySym.get(it.shcode);
+      if (!row) { row = { code: it.shcode, name: it.name, cells: {}, best: null, bestOos: -Infinity }; bySym.set(it.shcode, row); }
+      row.cells[it.strategy] = it;
+      // 베스트 = 실제 거래(OOS 신호>0)가 있은 전략 중 OOS 순수익 1위.
+      if (it.ok && (it.oos_total_signals ?? 0) > 0 && it.oos_avg_return > row.bestOos) {
+        row.bestOos = it.oos_avg_return;
+        row.best = it.strategy;
       }
     }
-    return added;
+    return [...bySym.values()].sort((a, b) => (b.bestOos === -Infinity ? -1e9 : b.bestOos) - (a.bestOos === -Infinity ? -1e9 : a.bestOos));
   }
 
-  $: criteriaKey = JSON.stringify({
-    tf: $selectedTimeframe,
-    strategy: $selectedStrategy,
-    market,
-    minPrice,
-    maxPrice,
-    watchlistOnly,
-    codes: watchlistOnly ? $watchlist : []
-  });
+  $: strategyCols = (matrix?.strategies ?? []) as string[];
+  $: tfByStrategy = Object.fromEntries(((matrix?.by_strategy ?? []) as any[]).map((s) => [s.strategy, s.tf]));
+  $: perSymbolRows = buildRows(matrix);
 
-  // 설정이 마지막 스캔 이후 바뀌었는지 — 표시된 결과가 오래됐음을 알린다.
-  $: dirty = hasScanned && criteriaKey !== scannedKey;
-  $: shown = signals;
-
-  // 자동 스캔하지 않는다 — eBest 상태만 조회하고 스캔은 사용자가 버튼으로 실행한다.
   onMount(loadEbestStatus);
 </script>
 
 <header>
-  <h1>패턴 시그널 대시보드</h1>
+  <h1>백테스트 기반 관심종목 선정 대시보드</h1>
   <p class="sub">
-    Caginalp & Laurent (1998) 8패턴 + ATR/거래량/MTF 혼합 스코어 · 설정 후 <b>수동 스캔</b> ·
-    <code>files/search_item.csv</code> 현재가 필터 후 최대 {DASHBOARD_SCAN_LIMIT}종목 스캔
+    ① <b>가격 필터</b>로 후보 선별 → ② 후보 전체를 <b>모든 전략으로 백테스트</b> →
+    ③ <b>OOS 순수익</b> 기준 관심종목 선정 + 종목별 베스트 전략 자동 배정
   </p>
 </header>
 
@@ -173,52 +193,109 @@
   <WatchlistPicker {market} {minPrice} {maxPrice} />
 </div>
 
-<div class="controls">
-  <div class="group"><label>타임프레임</label><TimeframeSelector /></div>
-  <div class="group">
-    <label>전략</label>
-    <select bind:value={$selectedStrategy}>{#each strategies as s}<option value={s}>{s}</option>{/each}</select>
+<!-- ① 가격 필터 스캔 -->
+<div class="step">
+  <div class="step-head"><span class="step-no">①</span> 가격 필터로 후보 선별 <span class="step-sub">— 패턴 감지 없이 현재가/시장 필터만 적용</span></div>
+  <div class="controls">
+    <div class="group">
+      <label>시장</label>
+      <select bind:value={market}><option>ALL</option><option>KOSPI</option><option>KOSDAQ</option></select>
+    </div>
+    <div class="group"><label>현재가 최소</label><input type="number" bind:value={minPrice} step="500" min="0" /></div>
+    <div class="group"><label>현재가 최대</label><input type="number" bind:value={maxPrice} step="500" min="0" /></div>
+    <div class="group"><label>후보 상한(종목수)</label><input type="number" bind:value={candidateLimit} step="10" min="1" /></div>
+    <button class="refresh" on:click={scan} disabled={scanning}>
+      {scanning ? '스캔중…' : scanned ? '↻ 다시 스캔' : '▶ 스캔'}
+    </button>
+    {#if scanned}<span class="cand-count">후보 <b>{candidates.length}</b>종목</span>{/if}
+    <a class="to-trading" href="/trading">관심종목으로 자동매매 →</a>
   </div>
-  <div class="group">
-    <label>시장</label>
-    <select bind:value={market}><option>ALL</option><option>KOSPI</option><option>KOSDAQ</option></select>
-  </div>
-  <div class="group">
-    <label>현재가 최소</label>
-    <input type="number" bind:value={minPrice} step="500" min="0" />
-  </div>
-  <div class="group">
-    <label>현재가 최대</label>
-    <input type="number" bind:value={maxPrice} step="500" min="0" />
-  </div>
-  <div class="group">
-    <label>종합≥% 자동등록</label>
-    <input type="number" bind:value={autoWatchThreshold} step="5" min="0" max="100" />
-  </div>
-  <button class="refresh" class:dirty on:click={scan} disabled={loading}>
-    {loading ? '스캔중…' : hasScanned ? '↻ 다시 스캔' : '▶ 스캔'}
-  </button>
-  <label class="chk">
-    <input type="checkbox" bind:checked={autoWatch} /> 종합≥{autoWatchThreshold}% 관심종목 자동등록
-  </label>
-  <label class="chk">
-    <input type="checkbox" bind:checked={watchlistOnly} /> 관심종목만 ({$watchlist.length})
-  </label>
-  <a class="to-trading" href="/trading">관심종목으로 자동매매 →</a>
 </div>
 
-{#if dirty}
-  <div class="hint">⚙️ 설정이 변경되었습니다 — <b>스캔</b> 버튼을 눌러 새 조건으로 조회하세요.</div>
-{/if}
-{#if autoWatch && autoWatchAdded > 0}
-  <div class="hint added">★ 종합 {autoWatchThreshold}% 이상 {autoWatchAdded}종목을 관심종목에 자동 등록했습니다.</div>
-{/if}
+<!-- ② 후보 전체 백테스트 -->
+<div class="step">
+  <div class="step-head"><span class="step-no">②</span> 후보 전체 백테스트 <span class="step-sub">— 종목 × 모든 전략 OOS 검증</span></div>
+  <div class="controls">
+    <div class="group">
+      <label>타임프레임</label>
+      <select bind:value={btTf}>
+        <option value="auto">auto (전략별 권장 TF)</option>
+        {#each ['1m','3m','5m','10m','15m','30m','60m','1d'] as t}<option value={t}>{t}</option>{/each}
+      </select>
+    </div>
+    <div class="group"><label>보유봉수</label>
+      <select bind:value={btHold}>{#each [5,10,25,40,60] as h}<option value={h}>{h}</option>{/each}</select></div>
+    <button class="bt-btn" on:click={runBacktest} disabled={backtesting || !candidates.length}>
+      {backtesting ? '백테스트 중…' : `▶ 후보 ${candidates.length}종목 백테스트`}
+    </button>
+    <span class="bt-note">auto는 종목당 1m·5m를 모두 조회하므로 후보 수에 비례해 시간이 걸립니다(종목당 약 1초/봉).</span>
+  </div>
+</div>
+
+<!-- ③ OOS 순수익 기준 선정 -->
+<div class="step">
+  <div class="step-head"><span class="step-no">③</span> OOS 순수익 기준 관심종목 선정 <span class="step-sub">— 종목별 베스트 전략 자동 배정</span></div>
+  <div class="controls">
+    <div class="group"><label>최소 OOS 순수익(%)</label><input type="number" bind:value={oosMinReturn} step="0.05" /></div>
+    <div class="group"><label>최대 선정 종목수</label><input type="number" bind:value={oosMaxPick} step="1" min="1" /></div>
+    <button class="bt-btn pick" on:click={selectFromMatrix} disabled={!matrix}>★ OOS 순수익으로 선정</button>
+    <span class="bt-note">종목마다 OOS 순수익이 가장 높은(통과) 전략을 골라 관심종목으로 선정하고, 자동매매에 종목별로 다르게 적용합니다.</span>
+  </div>
+  {#if oosSelectMsg}<div class="hint added">★ {oosSelectMsg}</div>{/if}
+  {#if Object.keys($symbolStrategies).length}
+    <div class="bt-assign">배정됨:
+      {#each $watchlist.filter((c) => $symbolStrategies[c]) as c}
+        <span class="assign-chip">{c} → <b>{$symbolStrategies[c]}</b></span>
+      {/each}
+    </div>
+  {/if}
+</div>
 
 {#if error}<div class="error">{error}</div>{/if}
 
-<div class="panel">
-  <SignalTable signals={shown} {loading} />
-</div>
+<!-- 종목별 × 전략별 백테스트 결과 (OOS 순수익) -->
+{#if matrix}
+  <div class="panel">
+    <h3>종목별 · 전략별 백테스트 결과 — OOS 순수익(%) · {matrix.auto ? 'TF auto(전략별 권장)' : matrix.timeframe} · 보유 {matrix.max_hold_bars}봉</h3>
+    <p class="legend">셀 = OOS 순수익(%) · <b>굵게</b> = 그 종목 OOS 순수익 1위(거래有) 전략 = 선정 기준 · <span class="tick">✓</span> = 강건성 통과(순수익&gt;0·일관성≥60%·신호≥10, 참고용)</p>
+    <div class="grid-wrap">
+      <table class="grid">
+        <thead>
+          <tr>
+            <th class="sticky">종목</th>
+            {#each strategyCols as s}<th>{s}<span class="th-tf">{tfByStrategy[s] ?? ''}</span></th>{/each}
+            <th>베스트</th><th>★</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each perSymbolRows as row}
+            <tr class:watched={$watchlist.includes(row.code)}>
+              <td class="sticky"><strong>{row.name || row.code}</strong><span class="code">{row.code}</span></td>
+              {#each strategyCols as s}
+                {@const it = row.cells[s]}
+                <td class="cell">
+                  {#if it && it.ok}
+                    <span class={(it.oos_avg_return ?? 0) >= 0 ? 'pos' : 'neg'} class:bestcell={row.best === s}>
+                      {(it.oos_avg_return ?? 0).toFixed(2)}{it.tradeable ? ' ✓' : ''}
+                    </span>
+                  {:else}<span class="na">-</span>{/if}
+                </td>
+              {/each}
+              <td>{row.best ? row.best : '—'}</td>
+              <td>
+                <button class="star" class:on={$watchlist.includes(row.code)}
+                  on:click={() => { watchlist.toggle(row.code); if (row.best) symbolStrategies.setOne(row.code, row.best); }}
+                  title="관심종목 추가/제거 (추가 시 베스트 전략 배정)">{$watchlist.includes(row.code) ? '★' : '☆'}</button>
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
+  </div>
+{:else if scanned}
+  <div class="panel empty">가격 필터로 후보 {candidates.length}종목을 선별했습니다. <b>② 백테스트</b>를 실행하면 종목별·전략별 OOS 순수익이 표시됩니다.</div>
+{/if}
 
 <style>
   header h1 { margin: 0 0 4px; font-size: 22px; }
@@ -230,13 +307,45 @@
   label { font-size: 12px; color: #9399b2; }
   select, input[type='number'] { background: #1e1e2e; color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px; padding: 5px 8px; width: 110px; }
   .refresh { background: #89b4fa; color: #1e1e2e; border: none; border-radius: 6px; padding: 8px 16px; font-weight: 600; cursor: pointer; }
-  .refresh.dirty { background: #f9e2af; box-shadow: 0 0 0 2px #f9e2af55; }
-  .hint { font-size: 13px; color: #f9e2af; background: #1f1d2e; border: 1px solid #45475a; border-radius: 6px; padding: 8px 12px; margin-bottom: 12px; }
+  .hint { font-size: 13px; color: #f9e2af; background: #1f1d2e; border: 1px solid #45475a; border-radius: 6px; padding: 8px 12px; margin: 10px 0 0; }
   .hint.added { color: #a6e3a1; }
-  .chk { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #cdd6f4; }
+  .step { background: #181825; border: 1px solid #313244; border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; }
+  .step-head { font-size: 14px; color: #cdd6f4; margin-bottom: 10px; }
+  .step-no { color: #89b4fa; font-weight: 700; }
+  .step-sub { color: #6c7086; font-size: 12px; font-weight: 400; }
+  .step .controls { margin-bottom: 0; }
+  .cand-count { font-size: 13px; color: #cdd6f4; align-self: center; }
+  .cand-count b { color: #a6e3a1; }
+  .bt-btn { background: #cba6f7; color: #1e1e2e; border: none; border-radius: 6px; padding: 8px 16px; font-weight: 600; cursor: pointer; }
+  .bt-btn.pick { background: #a6e3a1; }
+  .bt-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .bt-note { font-size: 12px; color: #6c7086; flex: 1; min-width: 240px; line-height: 1.5; }
+  .bt-assign { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; font-size: 12px; color: #9399b2; }
+  .assign-chip { background: #1e1e2e; border: 1px solid #313244; border-radius: 10px; padding: 2px 8px; }
+  .assign-chip b { color: #cba6f7; }
   .to-trading { margin-left: auto; color: #a6e3a1; text-decoration: none; font-size: 13px; align-self: center; }
-  .panel { background: #181825; border-radius: 10px; padding: 8px 16px; }
+  .panel { background: #181825; border-radius: 10px; padding: 12px 16px; margin-top: 4px; }
+  .panel.empty { color: #9399b2; font-size: 13px; }
+  .panel h3 { margin: 0 0 6px; font-size: 15px; }
+  .legend { color: #6c7086; font-size: 12px; margin: 0 0 12px; }
   .error { background: #f38ba8; color: #1e1e2e; padding: 10px; border-radius: 6px; margin-bottom: 12px; font-size: 13px; }
+  /* 종목 × 전략 OOS 격자 */
+  .grid-wrap { overflow-x: auto; }
+  table.grid { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.grid th { text-align: right; padding: 6px 8px; color: #9399b2; border-bottom: 1px solid #313244; font-weight: 500; white-space: nowrap; }
+  table.grid th:first-child { text-align: left; }
+  table.grid td { padding: 6px 8px; border-bottom: 1px solid #232334; text-align: right; font-variant-numeric: tabular-nums; }
+  table.grid td:first-child { text-align: left; }
+  .th-tf { display: block; font-size: 10px; color: #6c7086; font-weight: 400; }
+  .sticky { position: sticky; left: 0; background: #181825; z-index: 1; }
+  tr.watched .sticky { background: #1a1a2a; }
+  .code { color: #6c7086; margin-left: 6px; font-size: 11px; }
+  .cell .bestcell { font-weight: 700; background: #1d2a1d; padding: 1px 5px; border-radius: 4px; }
+  .na { color: #45475a; }
+  .pos { color: #a6e3a1; } .neg { color: #f38ba8; }
+  .tick { color: #a6e3a1; }
+  .star { background: none; border: none; cursor: pointer; font-size: 15px; color: #6c7086; padding: 0; }
+  .star.on { color: #f9e2af; }
 
   /* eBest API 패널 */
   .api-panel { background: #181825; border: 1px solid #313244; border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; }

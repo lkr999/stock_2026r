@@ -62,7 +62,7 @@ async fn get_indicators(State(st): State<AppState>, Path(shcode): Path<String>, 
     let tf = parse_tf(&q.tf)?;
     let token = st.token().await?;
     let candles = st.fetcher.fetch(&token, &shcode, tf).await;
-    let indicators = compute_all(&candles);
+    let indicators = compute_all(&candles, tf);
     Ok(Json(json!({
         "shcode": shcode, "name": name_for(&shcode), "timeframe": q.tf,
         "candles": candles, "indicators": indicators, "data_source": "live",

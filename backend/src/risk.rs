@@ -98,14 +98,36 @@ impl Default for RiskConfig {
     }
 }
 
+/// Position direction. Shorts are paper-simulation only (KR retail intraday
+/// shorting is effectively unavailable); the live broker rejects short orders.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Side {
+    Long,
+    Short,
+}
+
+impl Side {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Side::Long => "long",
+            Side::Short => "short",
+        }
+    }
+    /// Map a pattern type (`"bullish"` / `"bearish"`) to a trade side.
+    pub fn from_pattern_type(t: &str) -> Self {
+        if t == "bearish" { Side::Short } else { Side::Long }
+    }
+}
+
 /// An open position tracked by the risk manager.
 #[derive(Clone)]
 pub struct Position {
+    pub side: Side,
     pub entry: f64,
     pub qty: i64,
     pub stop: f64,
     pub target: f64,
-    pub peak: f64,
+    pub peak: f64, // best excursion: highest price for longs, lowest for shorts
     pub base_qty: i64, // first-entry size; basis for fib averaging multiples
     pub fib_level: i64,
 }
@@ -154,58 +176,84 @@ impl RiskManager {
         qty_by_risk.min(qty_by_cap).max(0)
     }
 
-    /// (stop, target) around an entry price.
+    /// (stop, target) around an entry price for the given side.
     /// Manual fixed-% takes priority when set (>0); otherwise falls back to ATR multiples.
-    pub fn stop_and_target(&self, entry: f64, atr: f64) -> (f64, f64) {
-        let stop = if self.cfg.stop_loss_pct > 0.0 {
-            entry * (1.0 - self.cfg.stop_loss_pct)
+    /// Shorts mirror longs: stop above entry, target below.
+    pub fn stop_and_target(&self, entry: f64, atr: f64, side: Side) -> (f64, f64) {
+        let stop_dist = if self.cfg.stop_loss_pct > 0.0 {
+            entry * self.cfg.stop_loss_pct
         } else {
-            entry - atr * self.cfg.stop_loss_atr_mult
+            atr * self.cfg.stop_loss_atr_mult
         };
-        let target = if self.cfg.take_profit_pct > 0.0 {
-            entry * (1.0 + self.cfg.take_profit_pct)
+        let target_dist = if self.cfg.take_profit_pct > 0.0 {
+            entry * self.cfg.take_profit_pct
         } else {
-            entry + atr * self.cfg.take_profit_atr_mult
+            atr * self.cfg.take_profit_atr_mult
         };
-        (stop, target)
+        match side {
+            Side::Long => (entry - stop_dist, entry + target_dist),
+            Side::Short => (entry + stop_dist, entry - target_dist),
+        }
     }
 
-    pub fn register(&mut self, code: &str, entry: f64, qty: i64, stop: f64, target: f64) {
+    pub fn register(&mut self, code: &str, side: Side, entry: f64, qty: i64, stop: f64, target: f64) {
         self.positions.insert(
             code.to_string(),
-            Position { entry, qty, stop, target, peak: entry, base_qty: qty, fib_level: 0 },
+            Position { side, entry, qty, stop, target, peak: entry, base_qty: qty, fib_level: 0 },
         );
     }
 
     /// Decide whether to exit: returns stop_loss / take_profit / trailing_stop / None.
+    /// Comparisons are direction-aware (shorts mirror longs).
     pub fn check_exit(&mut self, code: &str, price: f64, atr: f64) -> Option<&'static str> {
         let pos = self.positions.get_mut(code)?;
-        pos.peak = pos.peak.max(price);
-        let trail = pos.peak - atr * self.cfg.trailing_stop_atr;
-        if price <= pos.stop {
-            Some("stop_loss")
-        } else if price >= pos.target {
-            Some("take_profit")
-        } else if price <= trail && price > pos.entry {
-            Some("trailing_stop")
-        } else {
-            None
+        match pos.side {
+            Side::Long => {
+                pos.peak = pos.peak.max(price);
+                let trail = pos.peak - atr * self.cfg.trailing_stop_atr;
+                if price <= pos.stop {
+                    Some("stop_loss")
+                } else if price >= pos.target {
+                    Some("take_profit")
+                } else if price <= trail && price > pos.entry {
+                    Some("trailing_stop")
+                } else {
+                    None
+                }
+            }
+            Side::Short => {
+                pos.peak = pos.peak.min(price);
+                let trail = pos.peak + atr * self.cfg.trailing_stop_atr;
+                if price >= pos.stop {
+                    Some("stop_loss")
+                } else if price <= pos.target {
+                    Some("take_profit")
+                } else if price >= trail && price < pos.entry {
+                    Some("trailing_stop")
+                } else {
+                    None
+                }
+            }
         }
     }
 
-    /// Intrabar protection: live price at/below stop × (1 − buffer)?
+    /// Intrabar protection: live price beyond stop × (1 ∓ buffer)?
     pub fn hard_stop_hit(&self, code: &str, price: f64, buffer_pct: f64) -> bool {
-        self.positions
-            .get(code)
-            .is_some_and(|p| price <= p.stop * (1.0 - buffer_pct))
+        self.positions.get(code).is_some_and(|p| match p.side {
+            Side::Long => price <= p.stop * (1.0 - buffer_pct),
+            Side::Short => price >= p.stop * (1.0 + buffer_pct),
+        })
     }
 
     /// Whether another averaging-down level is available (feature on + level free).
+    /// Averaging-down is a long-only concept, so shorts never qualify.
     pub fn can_average(&self, code: &str) -> bool {
         if !self.cfg.fib_averaging_enabled || self.cfg.fib_max_levels <= 0 {
             return false;
         }
-        self.positions.get(code).is_some_and(|p| p.fib_level < self.cfg.fib_max_levels)
+        self.positions
+            .get(code)
+            .is_some_and(|p| p.side == Side::Long && p.fib_level < self.cfg.fib_max_levels)
     }
 
     /// Quantity to buy at the next averaging level = base_qty × fib(level+1).
@@ -223,14 +271,18 @@ impl RiskManager {
             if add_qty <= 0 {
                 return None;
             }
+            let side = pos.side;
             let new_qty = pos.qty + add_qty;
             let new_entry = (pos.entry * pos.qty as f64 + add_price * add_qty as f64) / new_qty as f64;
-            (stop, target) = self.stop_and_target(new_entry, atr);
+            (stop, target) = self.stop_and_target(new_entry, atr, side);
             let pos = self.positions.get_mut(code).unwrap();
             pos.entry = new_entry;
             pos.qty = new_qty;
             pos.fib_level += 1;
-            pos.peak = add_price.max(new_entry);
+            pos.peak = match side {
+                Side::Long => add_price.max(new_entry),
+                Side::Short => add_price.min(new_entry),
+            };
             pos.stop = stop;
             pos.target = target;
         }
@@ -255,5 +307,52 @@ impl RiskManager {
 
     pub fn reset_daily(&mut self) {
         self.daily_pnl = 0.0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mgr() -> RiskManager {
+        RiskManager::new(RiskConfig {
+            stop_loss_atr_mult: 1.0,
+            take_profit_atr_mult: 2.0,
+            trailing_stop_atr: 1.0,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn short_stop_target_mirror_long() {
+        let m = mgr();
+        let (ls, lt) = m.stop_and_target(100.0, 5.0, Side::Long);
+        let (ss, st) = m.stop_and_target(100.0, 5.0, Side::Short);
+        assert_eq!((ls, lt), (95.0, 110.0));
+        assert_eq!((ss, st), (105.0, 90.0)); // stop above, target below
+    }
+
+    #[test]
+    fn short_exit_hits_stop_above_entry() {
+        let mut m = mgr();
+        m.register("X", Side::Short, 100.0, 10, 105.0, 90.0);
+        assert_eq!(m.check_exit("X", 101.0, 5.0), None);
+        assert_eq!(m.check_exit("X", 106.0, 5.0), Some("stop_loss")); // price rose into stop
+    }
+
+    #[test]
+    fn short_exit_hits_target_below_entry() {
+        let mut m = mgr();
+        m.register("X", Side::Short, 100.0, 10, 105.0, 90.0);
+        assert_eq!(m.check_exit("X", 89.0, 5.0), Some("take_profit"));
+    }
+
+    #[test]
+    fn short_excluded_from_averaging() {
+        let mut m = RiskManager::new(RiskConfig { fib_averaging_enabled: true, fib_max_levels: 3, ..Default::default() });
+        m.register("L", Side::Long, 100.0, 10, 95.0, 110.0);
+        m.register("S", Side::Short, 100.0, 10, 105.0, 90.0);
+        assert!(m.can_average("L"));
+        assert!(!m.can_average("S"));
     }
 }

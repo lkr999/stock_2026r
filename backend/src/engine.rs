@@ -10,10 +10,12 @@ use crate::broker::{Broker, TradingMode};
 use crate::candle::Candle;
 use crate::candle_fetcher::CandleFetcher;
 use crate::ebest::EBestService;
+use crate::indicators::ema_values;
 use crate::journal::{now_iso, TradeJournal, TradeRecord};
 use crate::mtf::MtfEngine;
-use crate::pattern::{apply_strategy, compute_atr, PatternDetector, PatternResult};
-use crate::risk::{RiskConfig, RiskManager};
+use crate::pattern::{apply_strategy, compute_atr, detect_setups, PatternDetector, PatternResult};
+use crate::risk::{RiskConfig, RiskManager, Side};
+use crate::session::SessionContext;
 use crate::strategy::{Source, StrategyConfig};
 use crate::timeframe::Timeframe;
 use crate::universe::name_for;
@@ -95,6 +97,10 @@ struct Deps {
 /// Mutable engine state guarded by the engine mutex.
 struct State {
     strategy: StrategyConfig,
+    /// Per-symbol strategy overrides (code → strategy). Falls back to `strategy`.
+    /// Each symbol can be traded with the strategy that backtested best for it,
+    /// on that strategy's recommended timeframe.
+    symbol_strategies: HashMap<String, StrategyConfig>,
     risk: RiskManager,
     watchlist: Vec<String>,
     tf: Timeframe,
@@ -117,13 +123,20 @@ struct State {
 }
 
 impl State {
-    /// Equity = cash + holdings valued at the latest seen price (both modes).
+    /// Equity = cash + position marks. Longs are valued at market; short opens
+    /// credit no cash, so they contribute only their unrealized P&L (entry−price).
     fn equity(&self) -> f64 {
         let held: f64 = self
             .risk
             .open_positions()
             .iter()
-            .map(|(code, p)| p.qty as f64 * self.current_prices.get(code).copied().unwrap_or(p.entry))
+            .map(|(code, p)| {
+                let cur = self.current_prices.get(code).copied().unwrap_or(p.entry);
+                match p.side {
+                    Side::Long => p.qty as f64 * cur,
+                    Side::Short => (p.entry - cur) * p.qty as f64,
+                }
+            })
             .sum();
         self.cash + held
     }
@@ -133,6 +146,16 @@ impl State {
         if self.trade_events.len() > 500 {
             self.trade_events.drain(..self.trade_events.len() - 500);
         }
+    }
+
+    /// Strategy used for `code`: the per-symbol override, else the global strategy.
+    fn strategy_for(&self, code: &str) -> StrategyConfig {
+        self.symbol_strategies.get(code).cloned().unwrap_or_else(|| self.strategy.clone())
+    }
+
+    /// Timeframe `code` trades on: the assigned strategy's recommended TF, else the global TF.
+    fn tf_for(&self, code: &str) -> Timeframe {
+        self.symbol_strategies.get(code).map(|c| c.recommended_tf()).unwrap_or(self.tf)
     }
 
     /// Drop per-symbol state for codes no longer watched and not held.
@@ -152,6 +175,7 @@ impl State {
         self.bars_held.retain(|c, _| keep.contains(c));
         self.current_prices.retain(|c, _| keep.contains(c));
         self.monitor.retain(|c, _| keep.contains(c));
+        self.symbol_strategies.retain(|c, _| keep.contains(c));
     }
 
     /// Store this cycle's monitoring snapshot for one symbol (overwrites the previous).
@@ -188,6 +212,7 @@ impl TradingEngine {
         detector: PatternDetector,
         broker: Broker,
         strategy: StrategyConfig,
+        symbol_strategies: HashMap<String, StrategyConfig>,
         risk: RiskManager,
         watchlist: Vec<String>,
         tf: Timeframe,
@@ -200,6 +225,7 @@ impl TradingEngine {
         let deps = Arc::new(Deps { ebest, fetcher, detector, broker, journal, cost: CostModel::default() });
         let state = Arc::new(Mutex::new(State {
             strategy,
+            symbol_strategies,
             risk,
             watchlist,
             tf,
@@ -236,6 +262,7 @@ impl TradingEngine {
     pub async fn reconfigure(
         &self,
         strategy: StrategyConfig,
+        symbol_strategies: HashMap<String, StrategyConfig>,
         watchlist: Vec<String>,
         tf: Timeframe,
         ignore_market_hours: bool,
@@ -245,6 +272,7 @@ impl TradingEngine {
     ) {
         let mut s = self.state.lock().await;
         s.strategy = strategy;
+        s.symbol_strategies = symbol_strategies;
         s.watchlist = watchlist;
         s.tf = tf;
         s.ignore_market_hours = ignore_market_hours;
@@ -317,21 +345,30 @@ impl TradingEngine {
         let Some(pos) = s.risk.position(code).cloned() else {
             return json!({"ok": false, "reason": "no_position"});
         };
-        let (qty, entry) = (pos.qty, pos.entry);
+        let (qty, entry, side) = (pos.qty, pos.entry, pos.side);
         let order_type = s.order.order_type.clone();
         drop(s);
-        let fill = self.deps.broker.sell(&token, code, qty, price, &order_type).await;
+        let fill = match side {
+            Side::Long => self.deps.broker.sell(&token, code, qty, price, &order_type).await,
+            Side::Short => self.deps.broker.cover(&token, code, qty, price, &order_type).await,
+        };
         if !fill.ok {
             return json!({"ok": false, "reason": "order_failed"});
         }
         let mut s = self.state.lock().await;
-        s.cash += qty as f64 * fill.fill_price;
-        let pnl = (fill.fill_price - entry) * qty as f64;
-        let pnl_pct = if entry != 0.0 { (fill.fill_price - entry) / entry * 100.0 } else { 0.0 };
+        let dir = if side == Side::Short { -1.0 } else { 1.0 };
+        let pnl = (fill.fill_price - entry) * qty as f64 * dir;
+        match side {
+            Side::Long => s.cash += qty as f64 * fill.fill_price,
+            Side::Short => s.cash += pnl,
+        }
+        let pnl_pct = if entry != 0.0 { (fill.fill_price - entry) / entry * 100.0 * dir } else { 0.0 };
         record_close(&self.deps, &mut s, code, &pos, fill.fill_price, "manual_close", qty, true);
         s.risk.reduce(code, qty, pnl);
         s.append_event(json!({
-            "code": code, "name": name_for(code), "type": "sell", "price": fill.fill_price,
+            "code": code, "name": name_for(code), "side": side.as_str(),
+            "type": if side == Side::Short { "buy" } else { "sell" }, "action": "close",
+            "price": fill.fill_price,
             "qty": qty, "pnl": pnl.round(), "pnl_pct": (pnl_pct * 100.0).round() / 100.0,
             "reason": "manual_close", "ts": candle_ts, "time_label": hhmm_label(),
         }));
@@ -349,17 +386,19 @@ impl TradingEngine {
             .iter()
             .map(|(code, p)| {
                 let cur = s.current_prices.get(code).copied().unwrap_or(p.entry);
-                let upnl = (cur - p.entry) * p.qty as f64;
-                let upct = if p.entry != 0.0 { (cur - p.entry) / p.entry * 100.0 } else { 0.0 };
+                let dir = if p.side == Side::Short { -1.0 } else { 1.0 };
+                let upnl = (cur - p.entry) * p.qty as f64 * dir;
+                let upct = if p.entry != 0.0 { (cur - p.entry) / p.entry * 100.0 * dir } else { 0.0 };
                 let meta = s.opened_meta.get(code);
                 json!({
-                    "code": code, "name": name_for(code),
+                    "code": code, "name": name_for(code), "side": p.side.as_str(),
                     "entry": p.entry, "qty": p.qty, "stop": p.stop, "target": p.target,
                     "peak": p.peak, "base_qty": p.base_qty, "fib_level": p.fib_level,
                     "buy_price": p.entry.round(), "current_price": cur.round(),
                     "unrealized_pnl": upnl.round(), "unrealized_pct": (upct * 100.0).round() / 100.0,
                     "pattern": meta.map(|m| m.1.clone()).unwrap_or_default(),
                     "opened_at": meta.map(|m| m.0.clone()).unwrap_or_default(),
+                    "strategy": s.strategy_for(code).name, "tf": s.tf_for(code).as_str(),
                 })
             })
             .collect();
@@ -371,11 +410,18 @@ impl TradingEngine {
             .collect();
         let mut monitor: Vec<Value> = s.monitor.values().cloned().collect();
         monitor.sort_by(|a, b| a["code"].as_str().unwrap_or("").cmp(b["code"].as_str().unwrap_or("")));
+        // Per-symbol strategy assignments (code → {strategy, tf}) for the UI.
+        let symbol_strategies: serde_json::Map<String, Value> = s
+            .symbol_strategies
+            .iter()
+            .map(|(code, cfg)| (code.clone(), json!({"strategy": cfg.name, "tf": cfg.recommended_tf().as_str()})))
+            .collect();
         json!({
             "running": s.running,
             "mode": self.mode.as_str(),
             "strategy": s.strategy.name,
             "timeframe": s.tf.as_str(),
+            "symbol_strategies": symbol_strategies,
             "watchlist": s.watchlist,
             "poll_sec": s.poll_sec,
             "ignore_market_hours": s.ignore_market_hours,
@@ -468,8 +514,8 @@ async fn seed_equity(deps: &Deps, token: &str, seed_cash: f64) -> f64 {
 
 /// One full cycle over the watchlist + held codes.
 async fn scan_and_trade(deps: &Deps, state: &Arc<Mutex<State>>, token: &str) -> Result<(), String> {
-    // Snapshot codes + timeframe under the lock.
-    let (codes, tf) = {
+    // Snapshot codes under the lock (timeframe is resolved per symbol below).
+    let codes = {
         let s = state.lock().await;
         let mut codes: Vec<String> = s.watchlist.clone();
         for code in s.risk.open_positions().keys() {
@@ -477,7 +523,7 @@ async fn scan_and_trade(deps: &Deps, state: &Arc<Mutex<State>>, token: &str) -> 
                 codes.push(code.clone());
             }
         }
-        (codes, s.tf)
+        codes
     };
 
     // Drop monitoring rows for symbols no longer watched/held.
@@ -487,6 +533,8 @@ async fn scan_and_trade(deps: &Deps, state: &Arc<Mutex<State>>, token: &str) -> 
     }
 
     for code in codes {
+        // Each symbol trades on its assigned strategy's recommended timeframe.
+        let tf = { state.lock().await.tf_for(&code) };
         let candles = deps.fetcher.fetch(token, &code, tf).await;
         if candles.len() < 21 {
             let mut s = state.lock().await;
@@ -549,7 +597,7 @@ async fn scan_and_trade(deps: &Deps, state: &Arc<Mutex<State>>, token: &str) -> 
                 continue;
             }
         }
-        let eval = try_enter(deps, state, token, &code, closed, bar_price, atr, equity, bar_ts).await;
+        let eval = try_enter(deps, state, token, &code, closed, bar_price, atr, equity, bar_ts, tf).await;
         {
             let mut s = state.lock().await;
             s.record_monitor(&code, bar_price, live_price, atr, eval);
@@ -658,18 +706,27 @@ async fn exit(deps: &Deps, state: &Arc<Mutex<State>>, token: &str, code: &str, p
         };
         (pos, sell_qty, s.order.order_type.clone())
     };
-    let fill = deps.broker.sell(token, code, sell_qty, price, &order_type).await;
+    let fill = match pos.side {
+        Side::Long => deps.broker.sell(token, code, sell_qty, price, &order_type).await,
+        Side::Short => deps.broker.cover(token, code, sell_qty, price, &order_type).await,
+    };
     if !fill.ok {
         return;
     }
     let mut s = state.lock().await;
-    s.cash += sell_qty as f64 * fill.fill_price;
-    let pnl = (fill.fill_price - pos.entry) * sell_qty as f64;
-    let pnl_pct = if pos.entry != 0.0 { (fill.fill_price - pos.entry) / pos.entry * 100.0 } else { 0.0 };
+    let dir = if pos.side == Side::Short { -1.0 } else { 1.0 };
+    let pnl = (fill.fill_price - pos.entry) * sell_qty as f64 * dir;
+    match pos.side {
+        Side::Long => s.cash += sell_qty as f64 * fill.fill_price,
+        Side::Short => s.cash += pnl, // short open credited no cash; realize P&L on cover
+    }
+    let pnl_pct = if pos.entry != 0.0 { (fill.fill_price - pos.entry) / pos.entry * 100.0 * dir } else { 0.0 };
     let closed = s.risk.reduce(code, sell_qty, pnl);
     record_close(deps, &mut s, code, &pos, fill.fill_price, reason, sell_qty, closed);
     s.append_event(json!({
-        "code": code, "name": name_for(code), "type": "sell", "price": fill.fill_price,
+        "code": code, "name": name_for(code), "side": pos.side.as_str(),
+        "type": if pos.side == Side::Short { "buy" } else { "sell" }, "action": "close",
+        "price": fill.fill_price,
         "qty": sell_qty, "pnl": pnl.round(), "pnl_pct": (pnl_pct * 100.0).round() / 100.0,
         "reason": reason, "ts": candle_ts, "time_label": hhmm_label(),
     }));
@@ -701,10 +758,11 @@ async fn try_enter(
     atr: f64,
     equity: f64,
     candle_ts: i64,
+    tf: Timeframe,
 ) -> Eval {
     let (cfg, strategy) = {
         let s = state.lock().await;
-        (s.risk.cfg.clone(), s.strategy.clone())
+        (s.risk.cfg.clone(), s.strategy_for(code))
     };
 
     // Re-buy price guard — don't buy back at/above the stop-out price.
@@ -728,32 +786,69 @@ async fn try_enter(
         return Eval::new("데이터부족", "패턴 분석 데이터 부족");
     }
 
-    let tf = { state.lock().await.tf };
-    let results = deps.detector.scan(scan_input, tf, 0.0, true, &strategy, 1);
-    let top = results
-        .into_iter()
-        .find(|r| strategy.enabled_patterns.contains(&r.pattern_name) && r.pattern_type == "bullish");
-    let Some(mut top) = top else {
-        return Eval::new("신호없음", "매수 패턴 미감지");
+    // Candlestick patterns (windowed) + context setups (VWAP/ORB/EMA over the
+    // full session) form a single candidate pool, scored the same way.
+    let mut candidates = deps.detector.scan(scan_input, tf, 0.0, true, &strategy, 1);
+    {
+        let ctx = SessionContext::for_tf(scan_input, tf);
+        let ema9 = ema_values(scan_input, 9);
+        let ema20 = ema_values(scan_input, 20);
+        let mut setups = detect_setups(
+            scan_input,
+            scan_input.len() - 1,
+            &ctx,
+            &ema9,
+            &ema20,
+            &strategy.enabled_patterns,
+            strategy.allows_short(),
+        );
+        for s in &mut setups {
+            apply_strategy(s, &strategy, false, false, false);
+        }
+        candidates.append(&mut setups);
+    }
+    // Keep enabled candidates whose direction the strategy permits; best score wins.
+    candidates.retain(|r| {
+        strategy.enabled_patterns.contains(&r.pattern_name)
+            && ((r.pattern_type == "bullish" && strategy.allows_long())
+                || (r.pattern_type == "bearish" && strategy.allows_short()))
+    });
+    candidates.sort_by(|a, b| b.composite_score.partial_cmp(&a.composite_score).unwrap_or(std::cmp::Ordering::Equal));
+    let Some(mut top) = candidates.into_iter().next() else {
+        return Eval::new("신호없음", "매매 패턴 미감지");
     };
+    let side = Side::from_pattern_type(&top.pattern_type);
+    // Shorts are paper-simulation only — never short in live mode.
+    if side == Side::Short && deps.broker.mode == TradingMode::Live {
+        return Eval::with_signal("숏차단", format!("{} 감지 · 라이브 공매도 미지원", top.pattern_name), top.composite_score, &top.pattern_name);
+    }
 
-    // Confirmation: next bar bullish closing above the pattern, or breaking its high.
+    // Confirmation bar — direction-aware (longs break up, shorts break down).
     if let Some(confirm) = &confirm {
         let pattern_high = top.candles_used.iter().map(|c| c.high).fold(f64::MIN, f64::max);
+        let pattern_low = top.candles_used.iter().map(|c| c.low).fold(f64::MAX, f64::min);
         let pattern_close = top.candles_used.last().map(|c| c.close).unwrap_or(0.0);
-        let confirmed = confirm.close > pattern_high || (confirm.is_bull() && confirm.close > pattern_close);
+        let confirmed = match side {
+            Side::Long => confirm.close > pattern_high || (confirm.is_bull() && confirm.close > pattern_close),
+            Side::Short => confirm.close < pattern_low || (confirm.is_bear() && confirm.close < pattern_close),
+        };
         if !confirmed {
             tracing::info!("entry unconfirmed {code} ({})", top.pattern_name);
             return Eval::with_signal("확인봉대기", format!("{} 감지 · 확인봉 미충족", top.pattern_name), top.composite_score, &top.pattern_name);
         }
     }
 
-    // Higher-TF trend filter — block longs when the upper timeframe is falling.
+    // Higher-TF trend filter — block trades fighting the upper timeframe.
     if cfg.require_higher_tf_uptrend {
         let mtf = MtfEngine::new(&deps.fetcher, &deps.detector);
-        if !mtf.higher_tf_uptrend(token, code, tf).await {
-            tracing::info!("entry blocked {code}: higher_tf_downtrend");
-            return Eval::with_signal("상위TF하락", format!("{} 감지 · 상위 TF 하락으로 진입 차단", top.pattern_name), top.composite_score, &top.pattern_name);
+        let up = mtf.higher_tf_uptrend(token, code, tf).await;
+        let blocked = match side {
+            Side::Long => !up,
+            Side::Short => up,
+        };
+        if blocked {
+            tracing::info!("entry blocked {code}: higher_tf against {}", side.as_str());
+            return Eval::with_signal("상위TF역행", format!("{} 감지 · 상위 TF 역행으로 진입 차단", top.pattern_name), top.composite_score, &top.pattern_name);
         }
     }
 
@@ -795,25 +890,33 @@ async fn try_enter(
     if qty <= 0 {
         return Eval::with_signal("수량부족", format!("{} 감지 · 가용현금/한도로 매수수량 0", top.pattern_name), top.composite_score, &top.pattern_name);
     }
-    let fill = deps.broker.buy(token, code, qty, price, &order_type).await;
+    let fill = match side {
+        Side::Long => deps.broker.buy(token, code, qty, price, &order_type).await,
+        Side::Short => deps.broker.sell_short(token, code, qty, price, &order_type).await,
+    };
     if !fill.ok {
-        return Eval::with_signal("주문실패", format!("{} 매수 주문 실패", top.pattern_name), top.composite_score, &top.pattern_name);
+        return Eval::with_signal("주문실패", format!("{} 진입 주문 실패", top.pattern_name), top.composite_score, &top.pattern_name);
     }
     let mut s = state.lock().await;
-    s.cash -= qty as f64 * fill.fill_price;
-    let (stop, target) = s.risk.stop_and_target(fill.fill_price, atr);
-    s.risk.register(code, fill.fill_price, qty, stop, target);
+    if side == Side::Long {
+        s.cash -= qty as f64 * fill.fill_price; // short opens credit/use no cash in the paper sim
+    }
+    let (stop, target) = s.risk.stop_and_target(fill.fill_price, atr, side);
+    s.risk.register(code, side, fill.fill_price, qty, stop, target);
     s.opened_meta.insert(code.to_string(), (now_iso(), top.pattern_name.clone()));
     s.bars_held.insert(code.to_string(), 0);
     s.last_exit_price.remove(code);
+    let action_label = if side == Side::Short { "매도(숏)" } else { "매수" };
     s.append_event(json!({
-        "code": code, "name": name_for(code), "type": "buy", "price": fill.fill_price,
+        "code": code, "name": name_for(code), "side": side.as_str(),
+        "type": if side == Side::Short { "sell" } else { "buy" }, "action": "open",
+        "price": fill.fill_price,
         "qty": qty, "pnl": 0.0, "pnl_pct": 0.0, "reason": top.pattern_name,
         "ts": candle_ts, "time_label": hhmm_label(),
     }));
-    tracing::info!("ENTER {code} x{qty} @{:.0} stop={:.0} target={:.0} ({} {:.2})",
-        fill.fill_price, stop, target, top.pattern_name, top.composite_score);
-    Eval::with_signal("진입", format!("{} 매수 {qty}주 @{:.0}", top.pattern_name, fill.fill_price), top.composite_score, &top.pattern_name)
+    tracing::info!("ENTER {} {code} x{qty} @{:.0} stop={:.0} target={:.0} ({} {:.2})",
+        side.as_str(), fill.fill_price, stop, target, top.pattern_name, top.composite_score);
+    Eval::with_signal("진입", format!("{} {action_label} {qty}주 @{:.0}", top.pattern_name, fill.fill_price), top.composite_score, &top.pattern_name)
 }
 
 /// Cost/noise entry gates (composite threshold + volume + reward/risk + edge-over-cost).

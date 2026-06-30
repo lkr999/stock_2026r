@@ -5,6 +5,7 @@
 //! composite score is computed via `StrategyConfig` (section 10-1), not hardcoded.
 
 use crate::candle::Candle;
+use crate::session::SessionContext;
 use crate::strategy::{Source, StrategyConfig};
 use crate::timeframe::Timeframe;
 use serde::Serialize;
@@ -44,8 +45,8 @@ fn paper_returns(name: &str) -> (f64, f64, f64) {
     }
 }
 
-/// Every pattern name (used by the backtest `ALL_PATTERNS` set).
-pub const ALL_PATTERNS: [&str; 8] = [
+/// Every single-/few-bar pattern name (used by the batch backtest set).
+pub const ALL_PATTERNS: [&str; 16] = [
     "three_white_soldiers",
     "morning_star",
     "hammer",
@@ -54,6 +55,27 @@ pub const ALL_PATTERNS: [&str; 8] = [
     "evening_star",
     "hanging_man",
     "bearish_engulfing",
+    "pin_bar_bull",
+    "pin_bar_bear",
+    "inside_bar_break_up",
+    "inside_bar_break_down",
+    "tweezer_bottom",
+    "tweezer_top",
+    "marubozu_bull",
+    "marubozu_bear",
+];
+
+/// Context-aware day-trading setup names (VWAP / ORB / EMA pullback).
+/// These are detected by [`detect_setups`], not the windowed [`PatternDetector`].
+pub const SETUP_PATTERNS: [&str; 8] = [
+    "vwap_reclaim",
+    "vwap_loss",
+    "vwap_bounce",
+    "vwap_reject",
+    "orb_breakout",
+    "orb_breakdown",
+    "ema_pullback_long",
+    "ema_pullback_short",
 ];
 
 /// Least-squares slope of the closing prices (trend direction).
@@ -263,9 +285,125 @@ fn bearish_engulfing(c: &[Candle], lookback: usize) -> Option<PatternResult> {
     Some(result("bearish_engulfing", "bearish", &c2.ts, conf, vec![c1.clone(), c2.clone()]))
 }
 
-/// All eight detectors in priority order.
+// --------------------------------------------------------------------------
+// intraday candlestick patterns (단타 보강) — pin bar / inside-bar break /
+// tweezer / marubozu. Single-/few-bar geometry, so they slot into the same
+// windowed detector interface as the eight reversal patterns above.
+// --------------------------------------------------------------------------
+
+/// Bullish rejection (pin) bar: long lower wick, close in the upper third.
+fn pin_bar_bull(c: &[Candle], _lookback: usize) -> Option<PatternResult> {
+    let last = c.last()?;
+    let range = last.range();
+    if last.lower_shadow() < range * 0.6 || last.upper_shadow() > range * 0.2 {
+        return None;
+    }
+    if (last.close - last.low) / range < 0.6 {
+        return None;
+    }
+    let conf = (last.lower_shadow() / range).min(1.0) * 0.7 + 0.3;
+    Some(result("pin_bar_bull", "bullish", &last.ts, conf, vec![last.clone()]))
+}
+
+/// Bearish rejection (pin) bar: long upper wick, close in the lower third.
+fn pin_bar_bear(c: &[Candle], _lookback: usize) -> Option<PatternResult> {
+    let last = c.last()?;
+    let range = last.range();
+    if last.upper_shadow() < range * 0.6 || last.lower_shadow() > range * 0.2 {
+        return None;
+    }
+    if (last.high - last.close) / range < 0.6 {
+        return None;
+    }
+    let conf = (last.upper_shadow() / range).min(1.0) * 0.7 + 0.3;
+    Some(result("pin_bar_bear", "bearish", &last.ts, conf, vec![last.clone()]))
+}
+
+/// Inside-bar bullish breakout: inside bar contracts, next bar closes above the mother high.
+fn inside_bar_break_up(c: &[Candle], _lookback: usize) -> Option<PatternResult> {
+    let n = c.len();
+    if n < 3 {
+        return None;
+    }
+    let (mother, inside, brk) = (&c[n - 3], &c[n - 2], &c[n - 1]);
+    if inside.high > mother.high || inside.low < mother.low {
+        return None;
+    }
+    if !brk.is_bull() || brk.close <= mother.high {
+        return None;
+    }
+    let conf = (0.55 + (brk.close - mother.high) / mother.range() * 0.45).min(1.0);
+    Some(result("inside_bar_break_up", "bullish", &brk.ts, conf, vec![mother.clone(), inside.clone(), brk.clone()]))
+}
+
+/// Inside-bar bearish breakout: inside bar contracts, next bar closes below the mother low.
+fn inside_bar_break_down(c: &[Candle], _lookback: usize) -> Option<PatternResult> {
+    let n = c.len();
+    if n < 3 {
+        return None;
+    }
+    let (mother, inside, brk) = (&c[n - 3], &c[n - 2], &c[n - 1]);
+    if inside.high > mother.high || inside.low < mother.low {
+        return None;
+    }
+    if !brk.is_bear() || brk.close >= mother.low {
+        return None;
+    }
+    let conf = (0.55 + (mother.low - brk.close) / mother.range() * 0.45).min(1.0);
+    Some(result("inside_bar_break_down", "bearish", &brk.ts, conf, vec![mother.clone(), inside.clone(), brk.clone()]))
+}
+
+/// Tweezer bottom: matching lows after a down move, bear→bull pair.
+fn tweezer_bottom(c: &[Candle], lookback: usize) -> Option<PatternResult> {
+    let n = c.len();
+    if n < lookback + 2 || trend_slope(&c[n - lookback - 2..n - 2]) >= 0.0 {
+        return None;
+    }
+    let (c1, c2) = (&c[n - 2], &c[n - 1]);
+    let tol = (c1.range() + c2.range()) / 2.0 * 0.1;
+    if (c1.low - c2.low).abs() > tol || !c1.is_bear() || !c2.is_bull() {
+        return None;
+    }
+    let conf = (0.6 + c2.body_ratio() * 0.4).min(1.0);
+    Some(result("tweezer_bottom", "bullish", &c2.ts, conf, vec![c1.clone(), c2.clone()]))
+}
+
+/// Tweezer top: matching highs after an up move, bull→bear pair.
+fn tweezer_top(c: &[Candle], lookback: usize) -> Option<PatternResult> {
+    let n = c.len();
+    if n < lookback + 2 || trend_slope(&c[n - lookback - 2..n - 2]) <= 0.0 {
+        return None;
+    }
+    let (c1, c2) = (&c[n - 2], &c[n - 1]);
+    let tol = (c1.range() + c2.range()) / 2.0 * 0.1;
+    if (c1.high - c2.high).abs() > tol || !c1.is_bull() || !c2.is_bear() {
+        return None;
+    }
+    let conf = (0.6 + c2.body_ratio() * 0.4).min(1.0);
+    Some(result("tweezer_top", "bearish", &c2.ts, conf, vec![c1.clone(), c2.clone()]))
+}
+
+/// Bullish marubozu: near-full body, tiny wicks (momentum impulse).
+fn marubozu_bull(c: &[Candle], _lookback: usize) -> Option<PatternResult> {
+    let last = c.last()?;
+    if !last.is_bull() || last.body_ratio() < 0.90 {
+        return None;
+    }
+    Some(result("marubozu_bull", "bullish", &last.ts, last.body_ratio(), vec![last.clone()]))
+}
+
+/// Bearish marubozu: near-full body, tiny wicks (momentum impulse).
+fn marubozu_bear(c: &[Candle], _lookback: usize) -> Option<PatternResult> {
+    let last = c.last()?;
+    if !last.is_bear() || last.body_ratio() < 0.90 {
+        return None;
+    }
+    Some(result("marubozu_bear", "bearish", &last.ts, last.body_ratio(), vec![last.clone()]))
+}
+
+/// All sixteen single-/few-bar detectors in priority order.
 type Detector = fn(&[Candle], usize) -> Option<PatternResult>;
-const DETECTORS: [Detector; 8] = [
+const DETECTORS: [Detector; 16] = [
     three_white_soldiers,
     morning_star,
     hammer,
@@ -274,6 +412,14 @@ const DETECTORS: [Detector; 8] = [
     evening_star,
     hanging_man,
     bearish_engulfing,
+    pin_bar_bull,
+    pin_bar_bear,
+    inside_bar_break_up,
+    inside_bar_break_down,
+    tweezer_bottom,
+    tweezer_top,
+    marubozu_bull,
+    marubozu_bear,
 ];
 
 // --------------------------------------------------------------------------
@@ -328,6 +474,104 @@ pub fn apply_strategy(r: &mut PatternResult, cfg: &StrategyConfig, has_mtf: bool
         (Source::Gaf, has_gaf.then_some(r.gaf_score)),
     ]);
     r.composite_score = cfg.composite(&signals);
+}
+
+/// Mean volume over the `lookback` bars *before* bar `i` (0 if insufficient).
+fn avg_volume(candles: &[Candle], i: usize, lookback: usize) -> f64 {
+    if lookback == 0 || i < lookback {
+        return 0.0;
+    }
+    candles[i - lookback..i].iter().map(|c| c.volume).sum::<f64>() / lookback as f64
+}
+
+/// Detect context-aware day-trading setups (VWAP / ORB / EMA pullback) on the
+/// closed bar `i`. Unlike the windowed [`PatternDetector`], these need the full
+/// session history, supplied via the precomputed [`SessionContext`] and raw EMA
+/// arrays (`NaN` warmup) so VWAP/opening-range anchors stay correct.
+///
+/// Each result carries its own ATR/volume confirmation flags so the caller can
+/// run the same composite scoring and entry gates as the reversal patterns.
+/// Bearish setups are emitted only when `allow_short` is set.
+pub fn detect_setups(
+    candles: &[Candle],
+    i: usize,
+    ctx: &SessionContext,
+    ema9: &[f64],
+    ema20: &[f64],
+    enabled: &[String],
+    allow_short: bool,
+) -> Vec<PatternResult> {
+    let mut out: Vec<PatternResult> = vec![];
+    if i < 2 || i >= candles.len() {
+        return out;
+    }
+    // Need a prior *same-session* bar — otherwise VWAP/price comparisons would
+    // straddle the day boundary against the previous session's close.
+    if ctx.bars_into_day(i) < 1 {
+        return out;
+    }
+    let c = &candles[i];
+    let p = &candles[i - 1];
+    let vwap = ctx.vwap[i];
+    let vwap_prev = ctx.vwap[i - 1];
+    if !vwap.is_finite() || vwap <= 0.0 {
+        return out;
+    }
+
+    let atr = compute_atr(&candles[..=i], 14);
+    let vavg = avg_volume(candles, i, 10);
+    let vol_spike = vavg > 0.0 && c.volume >= vavg * 1.3;
+    let body_atr = atr > 0.0 && c.body() >= atr * 0.3;
+
+    let want = |name: &str| enabled.iter().any(|e| e == name);
+    let build = |name: &str, ptype: &str, conf: f64, used: Vec<Candle>| -> PatternResult {
+        let mut r = result(name, ptype, &c.ts, conf, used);
+        r.volume_confirmed = vol_spike;
+        r.atr_normalized = body_atr;
+        r.composite_score = r.confidence;
+        r
+    };
+
+    // VWAP reclaim / loss — close crosses back over the session VWAP.
+    if want("vwap_reclaim") && c.close > vwap && p.close < vwap_prev && c.is_bull() {
+        let conf = 0.55 + c.body_ratio() * 0.3 + if vol_spike { 0.15 } else { 0.0 };
+        out.push(build("vwap_reclaim", "bullish", conf, vec![p.clone(), c.clone()]));
+    }
+    if allow_short && want("vwap_loss") && c.close < vwap && p.close > vwap_prev && c.is_bear() {
+        let conf = 0.55 + c.body_ratio() * 0.3 + if vol_spike { 0.15 } else { 0.0 };
+        out.push(build("vwap_loss", "bearish", conf, vec![p.clone(), c.clone()]));
+    }
+
+    // VWAP bounce / reject — pullback to VWAP holds (above) or fails (below).
+    if want("vwap_bounce") && c.close > vwap && c.low <= vwap * 1.0015 && c.is_bull() {
+        out.push(build("vwap_bounce", "bullish", 0.5 + c.body_ratio() * 0.4, vec![c.clone()]));
+    }
+    if allow_short && want("vwap_reject") && c.close < vwap && c.high >= vwap * 0.9985 && c.is_bear() {
+        out.push(build("vwap_reject", "bearish", 0.5 + c.body_ratio() * 0.4, vec![c.clone()]));
+    }
+
+    // Opening-range breakout / breakdown — first close beyond the box.
+    let (orh, orl) = (ctx.or_high[i], ctx.or_low[i]);
+    if want("orb_breakout") && orh.is_finite() && c.close > orh && p.close <= orh && c.is_bull() {
+        let conf = 0.55 + if vol_spike { 0.25 } else { 0.0 } + c.body_ratio() * 0.2;
+        out.push(build("orb_breakout", "bullish", conf, vec![c.clone()]));
+    }
+    if allow_short && want("orb_breakdown") && orl.is_finite() && c.close < orl && p.close >= orl && c.is_bear() {
+        let conf = 0.55 + if vol_spike { 0.25 } else { 0.0 } + c.body_ratio() * 0.2;
+        out.push(build("orb_breakdown", "bearish", conf, vec![c.clone()]));
+    }
+
+    // EMA pullback continuation — trend-aligned dip that resumes.
+    let (e9, e20) = (ema9[i], ema20[i]);
+    if e9.is_finite() && e20.is_finite() {
+        if want("ema_pullback_long") && e9 > e20 && c.low <= e9 * 1.002 && c.close > e9 && c.is_bull() {
+            out.push(build("ema_pullback_long", "bullish", 0.55 + c.body_ratio() * 0.35, vec![c.clone()]));
+        }
+        if allow_short && want("ema_pullback_short") && e9 < e20 && c.high >= e9 * 0.998 && c.close < e9 && c.is_bear() {
+            out.push(build("ema_pullback_short", "bearish", 0.55 + c.body_ratio() * 0.35, vec![c.clone()]));
+        }
+    }
+    out
 }
 
 /// Stateless pattern detector (mirrors the Python `PatternDetector` class).

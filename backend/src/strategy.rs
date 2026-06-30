@@ -57,6 +57,8 @@ pub struct StrategyConfig {
     pub require_volume_confirm: bool,
     pub min_reward_risk: f64,
     pub min_edge_over_cost: f64,
+    /// Timeframe this strategy is tuned for (used by the "auto" backtest mode).
+    pub recommended_tf: String,
 }
 
 fn default_weights() -> HashMap<Source, f64> {
@@ -88,6 +90,7 @@ impl Default for StrategyConfig {
             require_volume_confirm: false,
             min_reward_risk: 0.0,
             min_edge_over_cost: 0.0,
+            recommended_tf: "5m".into(),
         }
     }
 }
@@ -110,6 +113,21 @@ impl StrategyConfig {
             .collect();
         let total_w: f64 = active.iter().map(|(_, w)| w).sum::<f64>().max(1e-9);
         active.iter().map(|(v, w)| v * w).sum::<f64>() / total_w
+    }
+
+    /// Whether long entries are permitted by `direction`.
+    pub fn allows_long(&self) -> bool {
+        self.direction != "short_only"
+    }
+
+    /// Whether short entries are permitted by `direction` (`both` / `short_only`).
+    pub fn allows_short(&self) -> bool {
+        self.direction == "both" || self.direction == "short_only"
+    }
+
+    /// The timeframe this strategy is tuned for, parsed (defaults to 5m).
+    pub fn recommended_tf(&self) -> crate::timeframe::Timeframe {
+        crate::timeframe::Timeframe::parse(&self.recommended_tf).unwrap_or(crate::timeframe::Timeframe::M5)
     }
 }
 
@@ -154,7 +172,60 @@ pub fn presets() -> Vec<StrategyConfig> {
             entry_threshold: 0.62,
             ..Default::default()
         },
+        // -------- day-trading (단타) setups: long+short, VWAP/ORB/EMA driven --------
+        StrategyConfig {
+            name: "vwap_scalp".into(),
+            recommended_tf: "1m".into(),
+            weights: w(0.55, 0.15, 0.30, 0.0, 0.0, 0.0),
+            enabled_patterns: setup_patterns(&["vwap_reclaim", "vwap_bounce", "vwap_loss", "vwap_reject"]),
+            entry_threshold: 0.60,
+            direction: "both".into(),
+            require_volume_confirm: true,
+            min_reward_risk: 1.2,
+            ..Default::default()
+        },
+        StrategyConfig {
+            name: "orb_breakout".into(),
+            recommended_tf: "1m".into(),
+            weights: w(0.50, 0.15, 0.35, 0.0, 0.0, 0.0),
+            enabled_patterns: setup_patterns(&["orb_breakout", "orb_breakdown", "marubozu_bull", "marubozu_bear"]),
+            entry_threshold: 0.60,
+            direction: "both".into(),
+            require_volume_confirm: true,
+            min_reward_risk: 1.3,
+            ..Default::default()
+        },
+        StrategyConfig {
+            name: "ema_pullback".into(),
+            recommended_tf: "1m".into(),
+            weights: w(0.60, 0.20, 0.20, 0.0, 0.0, 0.0),
+            enabled_patterns: setup_patterns(&["ema_pullback_long", "ema_pullback_short", "pin_bar_bull", "pin_bar_bear"]),
+            entry_threshold: 0.58,
+            direction: "both".into(),
+            min_reward_risk: 1.2,
+            ..Default::default()
+        },
+        StrategyConfig {
+            name: "intraday_blended".into(),
+            recommended_tf: "1m".into(),
+            weights: w(0.45, 0.15, 0.25, 0.15, 0.0, 0.0),
+            enabled_patterns: setup_patterns(&[
+                "vwap_reclaim", "vwap_bounce", "vwap_loss", "vwap_reject",
+                "orb_breakout", "orb_breakdown", "ema_pullback_long", "ema_pullback_short",
+                "pin_bar_bull", "pin_bar_bear",
+            ]),
+            entry_threshold: 0.60,
+            direction: "both".into(),
+            require_volume_confirm: true,
+            min_reward_risk: 1.2,
+            ..Default::default()
+        },
     ]
+}
+
+/// Helper to build an `enabled_patterns` list from string slices.
+fn setup_patterns(names: &[&str]) -> Vec<String> {
+    names.iter().map(|s| s.to_string()).collect()
 }
 
 /// Look up a preset by name, defaulting to `balanced`.
@@ -194,6 +265,7 @@ pub fn resolve(value: &Value) -> StrategyConfig {
                 require_volume_confirm: bo("require_volume_confirm", base.require_volume_confirm),
                 min_reward_risk: f("min_reward_risk", base.min_reward_risk),
                 min_edge_over_cost: f("min_edge_over_cost", base.min_edge_over_cost),
+                recommended_tf: map.get("recommended_tf").and_then(Value::as_str).unwrap_or(&base.recommended_tf).to_string(),
             }
         }
         _ => preset("balanced"),

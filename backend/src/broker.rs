@@ -62,6 +62,33 @@ impl Broker {
         self.order(token, code, "sell", qty, price, order_type).await
     }
 
+    /// Open a short (paper-simulation only). Live shorting is rejected because
+    /// KR retail intraday short-selling is effectively unavailable.
+    pub async fn sell_short(&self, _token: &str, code: &str, qty: i64, price: f64, _order_type: &str) -> Fill {
+        if self.mode == TradingMode::Live {
+            tracing::warn!("[LIVE] short open unsupported — rejected ({code})");
+            return Fill { ok: false, fill_price: price };
+        }
+        if qty <= 0 {
+            return Fill { ok: false, fill_price: price };
+        }
+        tracing::info!("[PAPER] SELL_SHORT {code} x{qty} @{price:.0}");
+        Fill { ok: true, fill_price: price }
+    }
+
+    /// Cover (buy to close) a short (paper-simulation only).
+    pub async fn cover(&self, _token: &str, code: &str, qty: i64, price: f64, _order_type: &str) -> Fill {
+        if self.mode == TradingMode::Live {
+            tracing::warn!("[LIVE] short cover unsupported — rejected ({code})");
+            return Fill { ok: false, fill_price: price };
+        }
+        if qty <= 0 {
+            return Fill { ok: false, fill_price: price };
+        }
+        tracing::info!("[PAPER] COVER {code} x{qty} @{price:.0}");
+        Fill { ok: true, fill_price: price }
+    }
+
     async fn order(&self, token: &str, code: &str, side: &str, qty: i64, price: f64, order_type: &str) -> Fill {
         if qty <= 0 {
             return Fill { ok: false, fill_price: price };

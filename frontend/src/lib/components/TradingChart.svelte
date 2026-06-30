@@ -20,6 +20,7 @@
   let nowLineEl: HTMLDivElement;
   let mainChart: any, rsiChart: any, macdChart: any;
   let candleS: any, volS: any, ma5S: any, ma20S: any, ma60S: any, bbU: any, bbM: any, bbL: any;
+  let vwapS: any, orHiS: any, orLoS: any, ema9S: any, ema20S: any; // 단타 오버레이
   let rsiS: any, macdS: any, sigS: any, histS: any;
   let ro: ResizeObserver;
   let initialized = false;
@@ -103,12 +104,15 @@
       const pnlText = ev.pnl !== 0
         ? ` (${ev.pnl >= 0 ? '+' : ''}${Math.round(ev.pnl).toLocaleString()}원 ${ev.pnl_pct >= 0 ? '+' : ''}${ev.pnl_pct.toFixed(1)}%)`
         : '';
+      const label = ev.side === 'short'
+        ? (ev.action === 'close' ? '숏청산' : '숏진입')
+        : (ev.action === 'close' ? '매도' : isBuy ? '매수' : '매도');
       markers.push({
         time: markerTs as any,
         position: isBuy ? 'belowBar' : 'aboveBar',
         color: isBuy ? '#a6e3a1' : '#f38ba8',
         shape: isBuy ? 'arrowUp' : 'arrowDown',
-        text: `${isBuy ? '매수' : '매도'} ${ev.qty.toLocaleString()}주@${Math.round(ev.price).toLocaleString()}${pnlText}`,
+        text: `${label} ${ev.qty.toLocaleString()}주@${Math.round(ev.price).toLocaleString()}${pnlText}`,
       });
     }
     markers.sort((a, b) => (a.time as number) - (b.time as number));
@@ -165,6 +169,11 @@
       bbU.setData(line(indicators.bb_upper, times));
       bbM.setData(line(indicators.bb_mid, times));
       bbL.setData(line(indicators.bb_lower, times));
+      vwapS.setData(line(indicators.vwap, times));
+      orHiS.setData(line(indicators.or_high, times));
+      orLoS.setData(line(indicators.or_low, times));
+      ema9S.setData(line(indicators.ema9, times));
+      ema20S.setData(line(indicators.ema20, times));
       rsiS.setData(line(indicators.rsi14, times));
       macdS.setData(line(indicators.macd, times));
       sigS.setData(line(indicators.macd_signal, times));
@@ -238,6 +247,12 @@
     ma5S = mainChart.addLineSeries({ color: '#f9e2af', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
     ma20S = mainChart.addLineSeries({ color: '#89b4fa', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
     ma60S = mainChart.addLineSeries({ color: '#cba6f7', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+    // 단타 오버레이: VWAP(굵은 주황 실선), 개장 레인지(점선), 단기 EMA(얇은 선)
+    vwapS = mainChart.addLineSeries({ color: '#fab387', lineWidth: 2, priceLineVisible: false, lastValueVisible: false });
+    orHiS = mainChart.addLineSeries({ color: 'rgba(166,227,161,0.6)', lineWidth: 1, lineStyle: LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false });
+    orLoS = mainChart.addLineSeries({ color: 'rgba(243,139,168,0.6)', lineWidth: 1, lineStyle: LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false });
+    ema9S = mainChart.addLineSeries({ color: 'rgba(148,226,213,0.7)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+    ema20S = mainChart.addLineSeries({ color: 'rgba(137,180,250,0.6)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
     volS = mainChart.addHistogramSeries({ priceFormat: { type: 'volume' }, priceScaleId: 'vol' });
     mainChart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
 
@@ -289,6 +304,8 @@
   <div class="legend">
     <span style="color:#f9e2af">MA5</span><span style="color:#89b4fa">MA20</span>
     <span style="color:#cba6f7">MA60</span><span style="color:#94a3b8">볼린저</span>
+    <span style="color:#fab387">VWAP</span><span style="color:#94e2d5">EMA9</span>
+    <span style="color:#a6e3a1">개장고</span><span style="color:#f38ba8">개장저</span>
     <span style="color:#a6e3a1">▲ 매수</span><span style="color:#f38ba8">▼ 매도</span>
   </div>
 

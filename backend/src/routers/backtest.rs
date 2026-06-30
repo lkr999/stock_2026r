@@ -1,10 +1,15 @@
-//! Backtest endpoints (cost-aware, walk-forward, preset comparison).
+//! Backtest endpoints — watchlist-wide only (single-symbol backtest removed).
+//!
+//! Two surfaces, both operating over the whole watchlist (`shcodes`):
+//!   - `/api/backtest/strategy-matrix` : 트레이더(전략 프리셋) × 종목 검증 + 베스트 전략 판정
+//!   - `/api/backtest/batch`           : 패턴별 통계(참고용)
 
 use crate::backtest::{backtest_many, evaluate_strategy_live, run_strategy_backtest, CostModel};
+use crate::candle::Candle;
 use crate::pattern::ALL_PATTERNS;
 use crate::risk::RiskConfig;
 use crate::state::AppState;
-use crate::strategy::{self, presets};
+use crate::strategy::{self, presets, StrategyConfig};
 use crate::timeframe::Timeframe;
 use crate::universe::name_for;
 use axum::extract::State;
@@ -12,6 +17,7 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 type ApiResult = Result<Json<Value>, (StatusCode, String)>;
 
@@ -42,91 +48,133 @@ fn all_patterns() -> Vec<String> {
     ALL_PATTERNS.iter().map(|s| s.to_string()).collect()
 }
 
-/// `POST /api/backtest` — pattern-only fixed-hold backtest.
-async fn backtest(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult {
-    let shcode = body.get("shcode").and_then(Value::as_str).ok_or((StatusCode::BAD_REQUEST, "shcode required".into()))?.to_string();
-    let tf = tf_of(&body, "1d");
-    let hold_bars = body.get("hold_bars").and_then(Value::as_u64).unwrap_or(5) as usize;
-    let patterns = body
-        .get("pattern_names")
+/// Extract a trimmed, non-empty `shcodes` list from the body.
+fn codes_of(body: &Value) -> Vec<String> {
+    body.get("shcodes")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-        .unwrap_or_else(all_patterns);
-    let cost = cost_of(&body);
-    let token = st.token().await?;
-    let candles = st.fetcher.fetch(&token, &shcode, tf).await;
-    let mut result = backtest_many(&candles, &patterns, tf, hold_bars, &cost);
-    result["shcode"] = json!(shcode);
-    result["timeframe"] = json!(tf.as_str());
-    result["hold_bars"] = json!(hold_bars);
-    result["round_trip_cost_pct"] = json!(cost.round_trip_cost() * 100.0);
-    Ok(Json(result))
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string())).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default()
 }
 
-/// `POST /api/backtest/strategy` — single symbol, live-equivalent + OOS.
-async fn backtest_strategy(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult {
-    let shcode = body.get("shcode").and_then(Value::as_str).ok_or((StatusCode::BAD_REQUEST, "shcode required".into()))?.to_string();
-    let tf = tf_of(&body, "5m");
-    let cfg = strategy::resolve(body.get("strategy").unwrap_or(&json!("balanced")));
-    let cost = cost_of(&body);
-    let risk = risk_of(&body);
-    let max_hold = body.get("max_hold_bars").and_then(Value::as_u64).unwrap_or(25) as usize;
-    let token = st.token().await?;
-    let candles = st.fetcher.fetch(&token, &shcode, tf).await;
-    let in_sample = run_strategy_backtest(&candles, &cfg, tf, &risk, &cost, max_hold);
-    let oos = evaluate_strategy_live(&candles, &cfg, tf, &risk, &cost);
-    Ok(Json(json!({
-        "shcode": shcode, "timeframe": tf.as_str(), "strategy": cfg.name,
-        "entry_threshold": cfg.entry_threshold, "round_trip_cost_pct": cost.round_trip_cost() * 100.0,
-        "in_sample": in_sample, "out_of_sample": oos, "tradeable": oos["tradeable"],
-    })))
+/// Signal-weighted mean of `field` over rows that have OOS signals.
+fn weighted(rows: &[&Value], field: &str) -> f64 {
+    let total: u64 = rows.iter().map(|r| r["oos_total_signals"].as_u64().unwrap_or(0)).sum();
+    if total == 0 {
+        return 0.0;
+    }
+    rows.iter()
+        .map(|r| r[field].as_f64().unwrap_or(0.0) * r["oos_total_signals"].as_u64().unwrap_or(0) as f64)
+        .sum::<f64>()
+        / total as f64
 }
 
-/// `POST /api/backtest/strategy-batch` — validate many symbols, select `tradeable` ones.
-async fn backtest_strategy_batch(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult {
+/// `POST /api/backtest/strategy-matrix` — every preset (트레이더) against every watchlist
+/// symbol, live-equivalent in-sample + walk-forward OOS, plus a per-strategy aggregate so the
+/// caller can see which strategy is actually best.
+///
+/// Timeframe modes (body `tf`):
+///   - a concrete value (`"1m"`, `"5m"`, …): every strategy is tested on that timeframe.
+///   - `"auto"`: each strategy is tested on **its own recommended timeframe**
+///     (reversal presets → 5m, day-trading setups → 1m), so all strategies compete fairly.
+/// Candles are fetched once per (symbol, timeframe) and reused across presets.
+async fn strategy_matrix(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult {
     let codes = codes_of(&body);
-    let tf = tf_of(&body, "5m");
-    let cfg = strategy::resolve(body.get("strategy").unwrap_or(&json!("balanced")));
+    if codes.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "shcodes required (관심종목이 비어 있습니다)".into()));
+    }
+    let tf_param = body.get("tf").and_then(Value::as_str).unwrap_or("1m").to_string();
+    let auto = tf_param == "auto";
+    let fixed_tf = tf_of(&body, "1m"); // ignored in auto mode
     let cost = cost_of(&body);
     let risk = risk_of(&body);
     let max_hold = body.get("max_hold_bars").and_then(Value::as_u64).unwrap_or(25) as usize;
     let token = st.token().await?;
+    let presets = presets();
 
+    // Timeframe each strategy is evaluated on.
+    let tf_for = |cfg: &StrategyConfig| if auto { cfg.recommended_tf() } else { fixed_tf };
+
+    // Per-(strategy, symbol) rows.
     let mut items: Vec<Value> = vec![];
     for code in &codes {
-        let candles = st.fetcher.fetch(&token, code, tf).await;
-        if candles.len() < 30 {
-            items.push(json!({"shcode": code, "name": name_for(code), "ok": false, "error": "캔들 부족(30개 미만)", "tradeable": false}));
-            continue;
+        let name = name_for(code);
+        // Fetch candles for each distinct timeframe this run needs (cache dedups).
+        let mut by_tf: HashMap<Timeframe, Vec<Candle>> = HashMap::new();
+        for cfg in &presets {
+            let t = tf_for(cfg);
+            if !by_tf.contains_key(&t) {
+                by_tf.insert(t, st.fetcher.fetch(&token, code, t).await);
+            }
         }
-        let in_sample = run_strategy_backtest(&candles, &cfg, tf, &risk, &cost, max_hold);
-        let oos = evaluate_strategy_live(&candles, &cfg, tf, &risk, &cost);
-        items.push(json!({
-            "shcode": code, "name": name_for(code), "ok": true, "error": Value::Null,
-            "in_sample_signals": in_sample["signals"], "in_sample_avg_return": in_sample["avg_return"],
-            "in_sample_win_rate": in_sample["win_rate"], "oos_avg_return": oos["oos_avg_return"],
-            "oos_consistency": oos["oos_consistency"], "oos_total_signals": oos["oos_total_signals"],
-            "tradeable": oos["tradeable"],
+        for cfg in &presets {
+            let t = tf_for(cfg);
+            let candles = by_tf.get(&t).expect("fetched above");
+            if candles.len() < 30 {
+                items.push(json!({
+                    "strategy": cfg.name, "shcode": code, "name": name, "tf": t.as_str(),
+                    "ok": false, "error": "캔들 부족(30개 미만)", "tradeable": false,
+                }));
+                continue;
+            }
+            let in_sample = run_strategy_backtest(candles, cfg, t, &risk, &cost, max_hold);
+            let oos = evaluate_strategy_live(candles, cfg, t, &risk, &cost);
+            items.push(json!({
+                "strategy": cfg.name, "shcode": code, "name": name, "tf": t.as_str(), "ok": true, "error": Value::Null,
+                "entry_threshold": cfg.entry_threshold,
+                "in_sample_signals": in_sample["signals"], "in_sample_avg_return": in_sample["avg_return"],
+                "in_sample_win_rate": in_sample["win_rate"], "in_sample_profit_factor": in_sample["profit_factor"],
+                "oos_avg_return": oos["oos_avg_return"], "oos_consistency": oos["oos_consistency"],
+                "oos_total_signals": oos["oos_total_signals"], "tradeable": oos["tradeable"],
+            }));
+        }
+    }
+
+    // Per-strategy aggregate, ranked best-first (more tradeable symbols, then higher weighted OOS).
+    let mut by_strategy: Vec<Value> = vec![];
+    for cfg in &presets {
+        let rows: Vec<&Value> = items
+            .iter()
+            .filter(|it| it["strategy"].as_str() == Some(cfg.name.as_str()) && it["ok"].as_bool().unwrap_or(false))
+            .collect();
+        let graded: Vec<&Value> = rows.iter().filter(|it| it["oos_total_signals"].as_u64().unwrap_or(0) > 0).copied().collect();
+        let selected: Vec<&str> = rows
+            .iter()
+            .filter(|it| it["tradeable"].as_bool().unwrap_or(false))
+            .filter_map(|it| it["shcode"].as_str())
+            .collect();
+        let total_sig: u64 = graded.iter().map(|it| it["oos_total_signals"].as_u64().unwrap_or(0)).sum();
+        by_strategy.push(json!({
+            "strategy": cfg.name, "entry_threshold": cfg.entry_threshold, "direction": cfg.direction,
+            "tf": tf_for(cfg).as_str(),
+            "graded_count": graded.len(), "tradeable_count": selected.len(),
+            "oos_avg_return": weighted(&graded, "oos_avg_return"),
+            "oos_consistency": weighted(&graded, "oos_consistency"),
+            "oos_total_signals": total_sig,
+            "selected": selected,
         }));
     }
-    // tradeable first, then by OOS net expectancy descending.
-    items.sort_by(|a, b| {
-        let key = |v: &Value| (v["tradeable"].as_bool().unwrap_or(false), v["oos_avg_return"].as_f64().unwrap_or(0.0));
-        let (ta, ra) = key(a);
-        let (tb, rb) = key(b);
-        (tb, rb).partial_cmp(&(ta, ra)).unwrap_or(std::cmp::Ordering::Equal)
+    by_strategy.sort_by(|a, b| {
+        let key = |v: &Value| (v["tradeable_count"].as_u64().unwrap_or(0), v["oos_avg_return"].as_f64().unwrap_or(0.0));
+        key(b).partial_cmp(&key(a)).unwrap_or(std::cmp::Ordering::Equal)
     });
-    let selected: Vec<&str> = items.iter().filter(|it| it["tradeable"].as_bool().unwrap_or(false)).filter_map(|it| it["shcode"].as_str()).collect();
+    let best = by_strategy.first().and_then(|s| s["strategy"].as_str()).map(String::from);
+
     Ok(Json(json!({
-        "timeframe": tf.as_str(), "strategy": cfg.name, "entry_threshold": cfg.entry_threshold,
-        "round_trip_cost_pct": cost.round_trip_cost() * 100.0, "count": items.len(),
-        "selected_count": selected.len(), "selected": selected, "items": items,
+        "timeframe": if auto { "auto".to_string() } else { fixed_tf.as_str().to_string() },
+        "auto": auto, "max_hold_bars": max_hold,
+        "round_trip_cost_pct": cost.round_trip_cost() * 100.0,
+        "count": codes.len(),
+        "strategies": presets.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+        "best_strategy": best, "by_strategy": by_strategy, "items": items,
     })))
 }
 
-/// `POST /api/backtest/batch` — pattern backtest across many symbols.
+/// `POST /api/backtest/batch` — pattern backtest across the watchlist (reference statistics).
 async fn backtest_batch(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult {
     let codes = codes_of(&body);
+    if codes.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "shcodes required (관심종목이 비어 있습니다)".into()));
+    }
     let tf = tf_of(&body, "1d");
     let hold_bars = body.get("hold_bars").and_then(Value::as_u64).unwrap_or(5) as usize;
     let cost = cost_of(&body);
@@ -179,46 +227,9 @@ async fn backtest_batch(State(st): State<AppState>, Json(body): Json<Value>) -> 
     })))
 }
 
-/// `POST /api/backtest/compare-strategies` — pattern-only vs as-traded vs OOS per preset.
-async fn compare_strategies(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult {
-    let shcode = body.get("shcode").and_then(Value::as_str).ok_or((StatusCode::BAD_REQUEST, "shcode required".into()))?.to_string();
-    let tf = tf_of(&body, "1d");
-    let hold_bars = body.get("hold_bars").and_then(Value::as_u64).unwrap_or(5) as usize;
-    let token = st.token().await?;
-    let candles = st.fetcher.fetch(&token, &shcode, tf).await;
-    let (cost, risk) = (CostModel::default(), RiskConfig::default());
-
-    let mut rows: Vec<Value> = vec![];
-    for cfg in presets() {
-        let reference = backtest_many(&candles, &cfg.enabled_patterns, tf, hold_bars, &cost);
-        let traded = run_strategy_backtest(&candles, &cfg, tf, &risk, &cost, 25);
-        let ev = evaluate_strategy_live(&candles, &cfg, tf, &risk, &cost);
-        rows.push(json!({
-            "preset": cfg.name, "entry_threshold": cfg.entry_threshold,
-            "total_signals": traded["signals"], "win_rate": traded["win_rate"],
-            "avg_return_net": traded["avg_return"], "profit_factor": traded["profit_factor"],
-            "oos_avg_return": ev["oos_avg_return"], "oos_consistency": ev["oos_consistency"], "tradeable": ev["tradeable"],
-            "ref_pattern_signals": reference["total_signals"], "ref_pattern_avg_return": reference["avg_return"],
-        }));
-    }
-    rows.sort_by(|a, b| b["oos_avg_return"].as_f64().unwrap_or(0.0).partial_cmp(&a["oos_avg_return"].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(Json(json!({"shcode": shcode, "timeframe": tf.as_str(), "results": rows})))
-}
-
-/// Extract a trimmed, non-empty `shcodes` list from the body.
-fn codes_of(body: &Value) -> Vec<String> {
-    body.get("shcodes")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string())).filter(|s| !s.is_empty()).collect())
-        .unwrap_or_default()
-}
-
 /// Backtest routes.
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/backtest", post(backtest))
-        .route("/api/backtest/strategy", post(backtest_strategy))
-        .route("/api/backtest/strategy-batch", post(backtest_strategy_batch))
+        .route("/api/backtest/strategy-matrix", post(strategy_matrix))
         .route("/api/backtest/batch", post(backtest_batch))
-        .route("/api/backtest/compare-strategies", post(compare_strategies))
 }
