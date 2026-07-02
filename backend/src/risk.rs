@@ -46,6 +46,24 @@ pub struct RiskConfig {
 }
 
 impl RiskConfig {
+    /// (stop distance, target distance) from an entry price. Manual fixed-%
+    /// (>0) takes priority over the ATR multiples. Shared by stop placement,
+    /// position sizing, the entry gates, and the backtester so they all judge
+    /// the same exits.
+    pub fn stop_target_dists(&self, entry: f64, atr: f64) -> (f64, f64) {
+        let stop = if self.stop_loss_pct > 0.0 {
+            entry * self.stop_loss_pct
+        } else {
+            atr * self.stop_loss_atr_mult
+        };
+        let target = if self.take_profit_pct > 0.0 {
+            entry * self.take_profit_pct
+        } else {
+            atr * self.take_profit_atr_mult
+        };
+        (stop, target)
+    }
+
     /// Serialize the full risk configuration for the status API.
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
@@ -154,6 +172,13 @@ impl RiskManager {
         self.daily_pnl
     }
 
+    /// Total notional committed across all open positions (Σ entry×qty, both
+    /// longs and shorts) — what the order-level `max_buy_amount` cap is
+    /// measured against (a portfolio-wide total, not a per-order limit).
+    pub fn total_entered_amount(&self) -> f64 {
+        self.positions.values().map(|p| p.entry * p.qty as f64).sum()
+    }
+
     /// Gate new entries on the daily-loss limit and max open positions.
     pub fn can_enter(&self, equity: f64) -> (bool, &'static str) {
         if self.daily_pnl <= -equity * self.cfg.daily_loss_limit_pct {
@@ -166,8 +191,9 @@ impl RiskManager {
     }
 
     /// Position size = min(risk-based qty, position-cap qty).
+    /// Risk-based sizing uses the *actual* stop distance (manual fixed-% when set).
     pub fn position_size(&self, equity: f64, entry: f64, atr: f64) -> i64 {
-        let stop_distance = atr * self.cfg.stop_loss_atr_mult;
+        let (stop_distance, _) = self.cfg.stop_target_dists(entry, atr);
         if stop_distance <= 0.0 || entry <= 0.0 {
             return 0;
         }
@@ -180,16 +206,7 @@ impl RiskManager {
     /// Manual fixed-% takes priority when set (>0); otherwise falls back to ATR multiples.
     /// Shorts mirror longs: stop above entry, target below.
     pub fn stop_and_target(&self, entry: f64, atr: f64, side: Side) -> (f64, f64) {
-        let stop_dist = if self.cfg.stop_loss_pct > 0.0 {
-            entry * self.cfg.stop_loss_pct
-        } else {
-            atr * self.cfg.stop_loss_atr_mult
-        };
-        let target_dist = if self.cfg.take_profit_pct > 0.0 {
-            entry * self.cfg.take_profit_pct
-        } else {
-            atr * self.cfg.take_profit_atr_mult
-        };
+        let (stop_dist, target_dist) = self.cfg.stop_target_dists(entry, atr);
         match side {
             Side::Long => (entry - stop_dist, entry + target_dist),
             Side::Short => (entry + stop_dist, entry - target_dist),
@@ -345,6 +362,30 @@ mod tests {
         let mut m = mgr();
         m.register("X", Side::Short, 100.0, 10, 105.0, 90.0);
         assert_eq!(m.check_exit("X", 89.0, 5.0), Some("take_profit"));
+    }
+
+    #[test]
+    fn manual_pct_overrides_atr_for_stops_and_sizing() {
+        let m = RiskManager::new(RiskConfig {
+            stop_loss_pct: 0.03,
+            take_profit_pct: 0.06,
+            ..Default::default()
+        });
+        // Manual 3%/6% beats the ATR multiples.
+        let (stop, target) = m.stop_and_target(100.0, 5.0, Side::Long);
+        assert_eq!((stop, target), (97.0, 106.0));
+        // Sizing uses the same manual stop distance: risk 1% of 1M = 10,000원,
+        // stop 3원 → 3333주, capped by 10% position cap → 1000주.
+        assert_eq!(m.position_size(1_000_000.0, 100.0, 5.0), 1000);
+    }
+
+    #[test]
+    fn total_entered_amount_sums_both_sides() {
+        let mut m = mgr();
+        assert_eq!(m.total_entered_amount(), 0.0);
+        m.register("L", Side::Long, 100.0, 10, 95.0, 110.0); // 1,000
+        m.register("S", Side::Short, 200.0, 5, 210.0, 180.0); // 1,000
+        assert_eq!(m.total_entered_amount(), 2000.0);
     }
 
     #[test]

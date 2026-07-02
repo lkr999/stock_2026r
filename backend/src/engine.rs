@@ -19,20 +19,24 @@ use crate::session::SessionContext;
 use crate::strategy::{Source, StrategyConfig};
 use crate::timeframe::Timeframe;
 use crate::universe::name_for;
-use chrono::{NaiveDate, Timelike, Utc};
+use chrono::{Datelike, NaiveDate, Timelike, Utc, Weekday};
 use chrono_tz::Asia::Seoul;
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-/// Order-execution settings (per-order qty, type, sell-all, buy cap).
+/// Order-execution settings (per-order qty, type, sell-all, portfolio buy cap).
 #[derive(Clone)]
 pub struct OrderConfig {
     pub order_type: String,
     pub fixed_qty: Option<i64>,
     pub sell_all: bool,
+    /// Cap on **total entered amount** across all open positions (Σ entry×qty,
+    /// both longs and shorts) — not a per-order limit. New entries and
+    /// averaging-down adds are sized down so the running total never exceeds
+    /// this (0 = uncapped).
     pub max_buy_amount: f64,
 }
 
@@ -77,7 +81,14 @@ fn candle_unix_ts(c: &Candle) -> i64 {
             }
         }
     }
-    Utc::now().timestamp()
+    kst_wallclock_unix()
+}
+
+/// Current KST wall-clock encoded as if it were UTC — the same convention
+/// `candle_unix_ts` applies to candle date/time fields, so chart markers align
+/// with the candle time scale instead of being shifted by 9 hours.
+fn kst_wallclock_unix() -> i64 {
+    Utc::now().with_timezone(&Seoul).naive_local().and_utc().timestamp()
 }
 
 fn hhmm_label() -> String {
@@ -292,10 +303,20 @@ impl TradingEngine {
 
     /// Spawn the polling loop (idempotent while already running).
     pub async fn start(&self, poll_sec: u64, resume: bool) {
+        if self.state.lock().await.running {
+            return;
+        }
+        // Wait for the previous loop task (if any) to fully exit first — a quick
+        // stop→start could otherwise flip `running` back to true while the old
+        // loop is still winding down, leaving two loops trading the same state.
+        let old = self.task.lock().unwrap().take();
+        if let Some(h) = old {
+            let _ = h.await;
+        }
         {
             let mut s = self.state.lock().await;
             if s.running {
-                return;
+                return; // another start won the race while we awaited
             }
             s.running = true;
             s.poll_sec = poll_sec;
@@ -306,12 +327,13 @@ impl TradingEngine {
         *self.task.lock().unwrap() = Some(handle);
     }
 
-    /// Stop the loop and abort the background task.
+    /// Stop the loop. The task is *not* aborted: killing it between sending an
+    /// order and updating internal state would desync positions/cash from the
+    /// real account. The loop observes `running=false` (checked every second
+    /// during its sleep) and exits on its own; the handle stays in `task` so
+    /// the next `start()` can await its completion.
     pub async fn stop(&self) {
         self.state.lock().await.running = false;
-        if let Some(h) = self.task.lock().unwrap().take() {
-            h.abort();
-        }
     }
 
     /// Clear this session's in-memory trade events; returns the count removed.
@@ -333,9 +355,10 @@ impl TradingEngine {
                 return json!({"ok": false, "reason": "no_position"});
             }
             price = s.current_prices.get(code).copied().unwrap_or_else(|| s.risk.position(code).unwrap().entry);
-            candle_ts = Utc::now().timestamp();
+            candle_ts = kst_wallclock_unix();
         }
-        let tf = self.state.lock().await.tf;
+        // Close on the same timeframe the symbol actually trades on.
+        let tf = self.state.lock().await.tf_for(code);
         let candles = self.deps.fetcher.fetch(&token, code, tf).await;
         if let Some(last) = candles.last() {
             price = last.close;
@@ -451,24 +474,43 @@ async fn resolve_token(deps: &Deps) -> String {
     }
 }
 
-/// True when the KST market is open (09:00–15:20), or hours are ignored.
+/// KRX holidays (YYYYMMDD, comma-separated) from `TRADING_HOLIDAYS`, parsed once.
+fn holidays() -> &'static HashSet<String> {
+    static H: OnceLock<HashSet<String>> = OnceLock::new();
+    H.get_or_init(|| {
+        std::env::var("TRADING_HOLIDAYS")
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// True when the KST market is open (Mon–Fri 09:00–15:20, not a listed
+/// holiday), or hours are ignored. Without the weekday check the engine would
+/// treat Friday's last bar as freshly closed on Saturday and enter on stale data.
 fn market_open(s: &State) -> bool {
     if s.ignore_market_hours {
         return true;
     }
     let now = Utc::now().with_timezone(&Seoul);
+    if matches!(now.weekday(), Weekday::Sat | Weekday::Sun) {
+        return false;
+    }
+    if holidays().contains(&now.format("%Y%m%d").to_string()) {
+        return false;
+    }
     let mins = now.hour() * 60 + now.minute();
     (9 * 60..=15 * 60 + 20).contains(&mins)
 }
 
 /// The background polling loop.
 async fn run_loop(deps: Arc<Deps>, state: Arc<Mutex<State>>, poll_sec: u64, resume: bool) {
-    let token = resolve_token(&deps).await;
     if !resume {
+        let token = resolve_token(&deps).await;
         let mut s = state.lock().await;
         s.risk.reset_daily();
         s.cash = seed_equity(&deps, &token, s.seed_cash).await;
     }
+    let mut last_day = Utc::now().with_timezone(&Seoul).date_naive();
     loop {
         {
             let s = state.lock().await;
@@ -476,11 +518,21 @@ async fn run_loop(deps: Arc<Deps>, state: Arc<Mutex<State>>, poll_sec: u64, resu
                 break;
             }
         }
+        // KST 날짜가 바뀌면 일일 손익/손실한도를 리셋한다 (엔진을 며칠 켜두는 경우).
+        let today = Utc::now().with_timezone(&Seoul).date_naive();
+        if today != last_day {
+            last_day = today;
+            state.lock().await.risk.reset_daily();
+        }
         let is_open = {
             let g = state.lock().await;
             market_open(&g)
         };
         if is_open {
+            // The token is cached by EBestService, so re-resolving each cycle is
+            // free while it is valid and transparently refreshes it once expired
+            // (avoids every TR call paying a fail→refresh→retry round trip).
+            let token = resolve_token(&deps).await;
             match scan_and_trade(&deps, &state, &token).await {
                 Ok(()) => {
                     let mut s = state.lock().await;
@@ -494,7 +546,16 @@ async fn run_loop(deps: Arc<Deps>, state: Arc<Mutex<State>>, poll_sec: u64, resu
                 }
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(poll_sec)).await;
+        // Sleep in 1s slices so a stop request takes effect promptly instead of
+        // lingering for up to a full poll interval.
+        let mut slept = 0u64;
+        while slept < poll_sec.max(1) {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            slept += 1;
+            if !state.lock().await.running {
+                return;
+            }
+        }
     }
 }
 
@@ -664,12 +725,15 @@ async fn manage_open(
 
 /// On a stop signal, buy a Fibonacci-sized lot instead of selling to lower the average.
 async fn fib_average_down(deps: &Deps, state: &Arc<Mutex<State>>, token: &str, code: &str, price: f64, atr: f64, candle_ts: i64) {
-    let (mut add_qty, order_type, max_buy, cash) = {
+    let (mut add_qty, order_type, max_buy, cash, entered) = {
         let s = state.lock().await;
-        (s.risk.next_fib_qty(code), s.order.order_type.clone(), s.order.max_buy_amount, s.cash)
+        (s.risk.next_fib_qty(code), s.order.order_type.clone(), s.order.max_buy_amount, s.cash, s.risk.total_entered_amount())
     };
+    // max_buy_amount caps the *total* entered amount across all positions, so
+    // the room left for this add is the cap minus what's already committed.
     if max_buy > 0.0 && price > 0.0 {
-        add_qty = add_qty.min((max_buy / price) as i64);
+        let remaining = (max_buy - entered).max(0.0);
+        add_qty = add_qty.min((remaining / price) as i64);
     }
     if price > 0.0 {
         add_qty = add_qty.min((cash / price) as i64);
@@ -793,6 +857,9 @@ async fn try_enter(
         let ctx = SessionContext::for_tf(scan_input, tf);
         let ema9 = ema_values(scan_input, 9);
         let ema20 = ema_values(scan_input, 20);
+        // Only generate bearish setups when the broker can actually execute a
+        // short — otherwise they'd just occupy the candidate pool and possibly
+        // outscore a real, executable bullish signal for nothing.
         let mut setups = detect_setups(
             scan_input,
             scan_input.len() - 1,
@@ -800,27 +867,29 @@ async fn try_enter(
             &ema9,
             &ema20,
             &strategy.enabled_patterns,
-            strategy.allows_short(),
+            strategy.allows_short() && deps.broker.supports_short(),
         );
         for s in &mut setups {
             apply_strategy(s, &strategy, false, false, false);
         }
         candidates.append(&mut setups);
     }
-    // Keep enabled candidates whose direction the strategy permits; best score wins.
+    // Keep enabled candidates whose direction the strategy *and* the broker permit
+    // (paper mirrors live: neither can execute a new short — see `Broker::supports_short`).
     candidates.retain(|r| {
         strategy.enabled_patterns.contains(&r.pattern_name)
             && ((r.pattern_type == "bullish" && strategy.allows_long())
-                || (r.pattern_type == "bearish" && strategy.allows_short()))
+                || (r.pattern_type == "bearish" && strategy.allows_short() && deps.broker.supports_short()))
     });
     candidates.sort_by(|a, b| b.composite_score.partial_cmp(&a.composite_score).unwrap_or(std::cmp::Ordering::Equal));
     let Some(mut top) = candidates.into_iter().next() else {
         return Eval::new("신호없음", "매매 패턴 미감지");
     };
     let side = Side::from_pattern_type(&top.pattern_type);
-    // Shorts are paper-simulation only — never short in live mode.
-    if side == Side::Short && deps.broker.mode == TradingMode::Live {
-        return Eval::with_signal("숏차단", format!("{} 감지 · 라이브 공매도 미지원", top.pattern_name), top.composite_score, &top.pattern_name);
+    // Defensive fallback — candidates are already filtered above, so this
+    // should be unreachable, but keep it in case that filter is ever bypassed.
+    if side == Side::Short && !deps.broker.supports_short() {
+        return Eval::with_signal("숏차단", format!("{} 감지 · 공매도 미지원(모의·실전 공통)", top.pattern_name), top.composite_score, &top.pattern_name);
     }
 
     // Confirmation bar — direction-aware (longs break up, shorts break down).
@@ -875,14 +944,16 @@ async fn try_enter(
         return Eval::with_signal("진입제한", format!("{} 감지 · 리스크 한도로 진입 제한 ({why})", top.pattern_name), top.composite_score, &top.pattern_name);
     }
 
-    // Sizing: fixed qty or risk-based, capped by max buy amount and available cash.
-    let (mut qty, order_type, max_buy, cash) = {
+    // Sizing: fixed qty or risk-based, capped by the portfolio-wide max buy
+    // amount (total entered across all positions, not just this order) and cash.
+    let (mut qty, order_type, max_buy, cash, entered) = {
         let s = state.lock().await;
         let q = s.order.fixed_qty.unwrap_or_else(|| s.risk.position_size(equity, price, atr));
-        (q, s.order.order_type.clone(), s.order.max_buy_amount, s.cash)
+        (q, s.order.order_type.clone(), s.order.max_buy_amount, s.cash, s.risk.total_entered_amount())
     };
     if max_buy > 0.0 && price > 0.0 {
-        qty = qty.min((max_buy / price) as i64);
+        let remaining = (max_buy - entered).max(0.0);
+        qty = qty.min((remaining / price) as i64);
     }
     if price > 0.0 {
         qty = qty.min((cash / price) as i64);
@@ -934,14 +1005,17 @@ fn passes_entry_gates(
     if strategy.require_volume_confirm && !result.volume_confirmed {
         return (false, "volume_not_confirmed".into());
     }
-    if strategy.min_reward_risk > 0.0 && risk.stop_loss_atr_mult > 0.0 {
-        let rr = risk.take_profit_atr_mult / risk.stop_loss_atr_mult;
+    // Use the *actual* stop/target distances (manual fixed-% takes priority over
+    // ATR multiples) so the gates judge the same exits the engine will place.
+    let (stop_dist, target_dist) = risk.stop_target_dists(price, atr);
+    if strategy.min_reward_risk > 0.0 && stop_dist > 0.0 {
+        let rr = target_dist / stop_dist;
         if rr < strategy.min_reward_risk {
             return (false, format!("reward_risk {rr:.2}<{}", strategy.min_reward_risk));
         }
     }
     if strategy.min_edge_over_cost > 0.0 && price > 0.0 {
-        let target_move_pct = atr * risk.take_profit_atr_mult / price * 100.0;
+        let target_move_pct = target_dist / price * 100.0;
         let cost_pct = cost.round_trip_cost() * 100.0;
         if target_move_pct < cost_pct * strategy.min_edge_over_cost {
             return (false, format!("edge {target_move_pct:.2}%<{:.2}%", cost_pct * strategy.min_edge_over_cost));
@@ -958,14 +1032,17 @@ fn record_close(deps: &Deps, s: &mut State, code: &str, pos: &crate::risk::Posit
         s.opened_meta.get(code).cloned()
     };
     let (opened_at, pattern) = meta.unwrap_or_default();
-    let ret_pct = if pos.entry != 0.0 { (exit_price - pos.entry) / pos.entry * 100.0 } else { 0.0 };
+    // Direction-aware P&L: a short profits when the exit is *below* the entry.
+    let dir = if pos.side == Side::Short { -1.0 } else { 1.0 };
+    let ret_pct = if pos.entry != 0.0 { (exit_price - pos.entry) / pos.entry * 100.0 * dir } else { 0.0 };
     deps.journal.record(&TradeRecord {
         mode: deps.broker.mode.as_str().to_string(),
         code: code.to_string(),
+        side: pos.side.as_str().to_string(),
         qty,
         entry: pos.entry,
         exit: exit_price,
-        pnl: (exit_price - pos.entry) * qty as f64,
+        pnl: (exit_price - pos.entry) * qty as f64 * dir,
         return_pct: ret_pct,
         reason: reason.to_string(),
         pattern,

@@ -14,6 +14,9 @@ use std::sync::Mutex;
 pub struct TradeRecord {
     pub mode: String, // "paper" | "live"
     pub code: String,
+    /// "long" | "short" — P&L in this record is direction-aware.
+    #[serde(default)]
+    pub side: String,
     pub qty: i64,
     pub entry: f64,
     pub exit: f64,
@@ -25,7 +28,9 @@ pub struct TradeRecord {
     pub closed_at: String,
 }
 
-/// Append-only journal persisted as a JSON array; guarded by a mutex.
+/// Append-only journal persisted as JSON Lines (one record per line); guarded
+/// by a mutex. JSONL keeps `record()` an O(1) append instead of re-reading and
+/// pretty-printing the whole file for every trade.
 pub struct TradeJournal {
     path: PathBuf,
     lock: Mutex<()>,
@@ -33,36 +38,54 @@ pub struct TradeJournal {
 
 impl TradeJournal {
     /// Open (or create) the journal at `backend/data/trade_journal.json`.
+    /// A legacy JSON-array file is migrated to JSONL in place on first open.
     pub fn new() -> Self {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/trade_journal.json");
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         if !path.exists() {
-            let _ = std::fs::write(&path, "[]");
+            let _ = std::fs::write(&path, "");
+        }
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        if content.trim_start().starts_with('[') {
+            if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&content) {
+                let jsonl: String = arr.iter().filter_map(|v| serde_json::to_string(v).ok()).map(|l| l + "\n").collect();
+                let _ = std::fs::write(&path, jsonl);
+                tracing::info!("[journal] migrated legacy JSON array → JSONL ({} records)", arr.len());
+            }
         }
         Self { path, lock: Mutex::new(()) }
     }
 
     fn read(&self) -> Vec<Value> {
-        std::fs::read_to_string(&self.path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        let Ok(s) = std::fs::read_to_string(&self.path) else {
+            return vec![];
+        };
+        // Legacy array (not yet migrated) or JSONL — accept both.
+        if s.trim_start().starts_with('[') {
+            return serde_json::from_str(&s).unwrap_or_default();
+        }
+        s.lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
     }
 
     fn write(&self, data: &[Value]) {
-        if let Ok(s) = serde_json::to_string_pretty(data) {
-            let _ = std::fs::write(&self.path, s);
-        }
+        let jsonl: String = data.iter().filter_map(|v| serde_json::to_string(v).ok()).map(|l| l + "\n").collect();
+        let _ = std::fs::write(&self.path, jsonl);
     }
 
-    /// Append one closed trade.
+    /// Append one closed trade (O(1) — a single line write).
     pub fn record(&self, trade: &TradeRecord) {
         let _g = self.lock.lock().unwrap();
-        let mut data = self.read();
-        data.push(serde_json::to_value(trade).unwrap());
-        self.write(&data);
+        if let Ok(line) = serde_json::to_string(trade) {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.path) {
+                let _ = writeln!(f, "{line}");
+            }
+        }
         tracing::info!("[journal] {} {} pnl={:.0} ({:.2}%)", trade.mode, trade.code, trade.pnl, trade.return_pct);
     }
 

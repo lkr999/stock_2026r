@@ -64,6 +64,19 @@ async fn readiness(State(st): State<AppState>) -> ApiResult {
     Ok(Json(report))
 }
 
+/// `GET /api/trading/balance` — real eBest account deposit (t0424), for the
+/// live-mode "매수 한도액" default (총 진입금액 한도 = 잔고금액).
+async fn balance(State(st): State<AppState>) -> ApiResult {
+    let token = st.token().await?;
+    let bal = st.ebest.get_account_balance(&token).await;
+    let deposit = bal
+        .get("t0424OutBlock")
+        .and_then(|b| b.get("sunamt"))
+        .and_then(crate::ebest::parse_float)
+        .unwrap_or(0.0);
+    Ok(Json(json!({"balance": deposit})))
+}
+
 /// `GET /api/trading/journal` — recent trades for a mode, newest first.
 async fn journal(State(st): State<AppState>, Query(q): Query<JournalQuery>) -> ApiResult {
     let mut trades = st.journal.by_mode(&q.mode);
@@ -180,13 +193,26 @@ fn order_config(body: &Value, settings: &Settings) -> OrderConfig {
 }
 
 /// Keep only OOS-validated (`tradeable`) codes; return (kept, dropped).
-async fn filter_tradeable(st: &AppState, cfg: &StrategyConfig, watchlist: &[String], tf: Timeframe) -> (Vec<String>, Vec<String>) {
+///
+/// Each symbol is validated with the **same strategy + timeframe it will actually trade on**:
+/// the per-symbol assignment (from the dashboard backtest) when present, else the global
+/// strategy/TF. This keeps the OOS gate consistent with the engine's `tf_for`/`strategy_for`.
+async fn filter_tradeable(
+    st: &AppState,
+    cfg: &StrategyConfig,
+    symbol_strats: &HashMap<String, StrategyConfig>,
+    watchlist: &[String],
+    tf: Timeframe,
+    risk: &RiskConfig,
+) -> (Vec<String>, Vec<String>) {
     let token = st.ebest.auth_token(false).await.unwrap_or_default();
-    let (risk, cost) = (RiskConfig::default(), CostModel::default());
+    let cost = CostModel::default();
     let (mut kept, mut dropped) = (vec![], vec![]);
     for code in watchlist {
-        let candles = st.fetcher.fetch(&token, code, tf).await;
-        let oos = evaluate_strategy_live(&candles, cfg, tf, &risk, &cost);
+        let sym_cfg = symbol_strats.get(code).unwrap_or(cfg);
+        let sym_tf = symbol_strats.get(code).map(|c| c.recommended_tf()).unwrap_or(tf);
+        let candles = st.fetcher.fetch(&token, code, sym_tf).await;
+        let oos = evaluate_strategy_live(&candles, sym_cfg, sym_tf, risk, &cost);
         if oos["tradeable"].as_bool().unwrap_or(false) {
             kept.push(code.clone());
         } else {
@@ -216,10 +242,11 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
     let poll_sec = body.get("poll_sec").and_then(Value::as_u64).unwrap_or(60);
     let risk_cfg = risk_config(&body, settings);
 
-    // Optional OOS pre-filter of the watchlist.
+    // Optional OOS pre-filter of the watchlist — validated with the same risk
+    // settings the engine will actually trade with (not the defaults).
     let mut dropped: Vec<String> = vec![];
     if body.get("require_tradeable").and_then(Value::as_bool).unwrap_or(false) {
-        let (kept, drop) = filter_tradeable(&st, &cfg, &watchlist, tf).await;
+        let (kept, drop) = filter_tradeable(&st, &cfg, &symbol_strats, &watchlist, tf, &risk_cfg).await;
         watchlist = kept;
         dropped = drop;
         if watchlist.is_empty() {
@@ -227,14 +254,26 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
         }
     }
 
-    let order_cfg = order_config(&body, settings);
+    let mut order_cfg = order_config(&body, settings);
+    // 현재 주문 경로는 "접수 성공 = 요청가 체결"로 간주한다. 지정가가 미체결로 남으면
+    // 내부 포지션/현금이 실계좌와 어긋나므로, 체결 대사가 구현되기 전까지 실전은
+    // 시장가만 허용한다 (모의투자는 즉시 체결 시뮬레이션이라 무관).
+    if mode == TradingMode::Live && order_cfg.order_type != "market" {
+        tracing::warn!("live mode: order_type '{}' → 'market' 로 강제 (미체결 대사 미구현)", order_cfg.order_type);
+        order_cfg.order_type = "market".into();
+    }
     let ignore_hours = body.get("ignore_market_hours").and_then(Value::as_bool).unwrap_or(false);
     let reset = body.get("reset").and_then(Value::as_bool).unwrap_or(false);
+
+    // Hold the engine slot lock across check + reuse/create so two concurrent
+    // start requests cannot each spawn an engine (one of which would become an
+    // orphaned trading loop with no handle).
+    let mut guard = st.engine.lock().await;
 
     // Already running? Apply the new config in place (keep positions/cash) instead of
     // refusing — this is how a watchlist change takes effect: held codes stay, the rest
     // are replaced by the updated watchlist on the next cycle.
-    if let Some(engine) = st.engine.lock().await.clone() {
+    if let Some(engine) = guard.clone() {
         if engine.running().await {
             if reset {
                 return Err((StatusCode::CONFLICT, "리셋하려면 먼저 자동매매를 중지하세요.".into()));
@@ -246,16 +285,16 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
             engine
                 .reconfigure(cfg, symbol_strats, watchlist, tf, ignore_hours, order_cfg, risk_cfg, settings.trading_paper_seed)
                 .await;
+            let status = engine.status().await;
             return Ok(Json(json!({
                 "ok": true, "mode": mode.as_str(), "resumed": true, "reconfigured": true,
-                "dropped_untradeable": dropped, "status": engine.status().await,
+                "dropped_untradeable": dropped, "status": status,
                 "readiness_advisory": Value::Null,
             })));
         }
     }
 
     // Reuse the existing engine (keep positions/cash) only when same mode + not resetting.
-    let mut guard = st.engine.lock().await;
     let reuse = matches!(&*guard, Some(e) if !reset && e.mode() == mode);
     let engine: Arc<TradingEngine>;
     if reuse {
@@ -265,6 +304,11 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
             .await;
         engine.start(poll_sec, true).await;
     } else {
+        // Make sure any previous engine's loop is stopped before dropping our
+        // only reference to it — otherwise its spawned task would keep trading.
+        if let Some(old) = guard.take() {
+            old.stop().await;
+        }
         let broker = Broker::new(Some(st.ebest.clone()), mode);
         let new_engine = Arc::new(TradingEngine::new(
             Some(st.ebest.clone()),
@@ -336,6 +380,7 @@ async fn update_strategy(State(st): State<AppState>, Json(body): Json<Value>) ->
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/trading/readiness", get(readiness))
+        .route("/api/trading/balance", get(balance))
         .route("/api/trading/journal", get(journal))
         .route("/api/trading/journal/clear", post(clear_journal))
         .route("/api/trading/stats", get(stats))

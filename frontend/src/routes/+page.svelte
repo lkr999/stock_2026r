@@ -3,14 +3,19 @@
   import { api, type UniverseItem, type EbestStatus, type EbestTestResult } from '$lib/api';
   import { watchlist } from '$lib/stores/watchlist';
   import { symbolStrategies } from '$lib/stores/symbolStrategies';
+  import { loadDashboardState, saveDashboardState } from '$lib/stores/dashboardState';
+  import { tradingStatus } from '$lib/stores/tradingStatus';
   import WatchlistPicker from '$lib/components/WatchlistPicker.svelte';
+
+  // 이전에 저장한 대시보드 상태(설정+결과)를 복원한다 (페이지 이동 후에도 유지).
+  const dsaved = loadDashboardState();
 
   // eBest API 통신 상태/테스트
   let ebestStatus: EbestStatus | null = null;
   let ebestResult: EbestTestResult | null = null;
-  let testCode = '005930';
+  let testCode = dsaved.testCode ?? '005930';
   let testing = false;
-  let apiPanelOpen = true;
+  let apiPanelOpen = dsaved.apiPanelOpen ?? true;
 
   async function loadEbestStatus() {
     try { ebestStatus = await api.ebestStatus(); } catch (e) { /* ignore */ }
@@ -26,24 +31,31 @@
   let error = '';
 
   // ── 1단계: 가격 필터 스캔 (패턴 감지 없이, 현재가/시장 필터만으로 후보 선별) ──
-  let market = 'ALL';
-  let minPrice: number | undefined = 1000;
-  let maxPrice: number | undefined = 100000;
-  let candidateLimit = 60;          // 백테스트 대상 상한 (eBest 호출 한도 고려)
-  let candidates: UniverseItem[] = [];
+  let market = dsaved.market ?? 'ALL';
+  let minPrice: number | undefined = dsaved.minPrice ?? 1000;
+  let maxPrice: number | undefined = dsaved.maxPrice ?? 100000;
+  let candidateLimit = dsaved.candidateLimit ?? 60;          // 백테스트 대상 상한 (eBest 호출 한도 고려)
+  let candidates: UniverseItem[] = dsaved.candidates ?? [];
   let scanning = false;
-  let scanned = false;
+  let scanned = dsaved.scanned ?? false;
 
   // ── 2단계: 후보 전체 백테스트 (모든 전략 × 모든 종목) ──
-  let btTf = 'auto';                // 'auto' = 전략별 권장 TF
-  let btHold = 25;
-  let matrix: any = null;
+  let btTf = dsaved.btTf ?? 'auto';                // 'auto' = 전략별 권장 TF
+  let btHold = dsaved.btHold ?? 25;
+  let matrix: any = dsaved.matrix ?? null;
   let backtesting = false;
 
   // ── 3단계: OOS 순수익 기준 관심종목 선정 + 종목별 베스트 전략 배정 ──
-  let oosMinReturn = 0;             // 최소 OOS 순수익(%)
-  let oosMaxPick = 15;             // 최대 선정 종목 수
-  let oosSelectMsg = '';
+  let oosMinReturn = dsaved.oosMinReturn ?? 0;             // 최소 OOS 순수익(%)
+  let oosMaxPick = dsaved.oosMaxPick ?? 15;             // 최대 선정 종목 수
+  let oosSelectMsg = dsaved.oosSelectMsg ?? '';
+
+  // 설정·결과가 바뀔 때마다 localStorage 에 저장 → 페이지 이동 후에도 복원된다.
+  $: saveDashboardState({
+    market, minPrice, maxPrice, candidateLimit, candidates, scanned,
+    btTf, btHold, matrix, oosMinReturn, oosMaxPick, oosSelectMsg,
+    testCode, apiPanelOpen,
+  });
 
   // 1단계: 현재가/시장 필터로 후보 종목 목록만 가져온다 (패턴 스캔 아님).
   async function scan() {
@@ -97,10 +109,12 @@
       return;
     }
     watchlist.clear();
-    const map: Record<string, string> = {};
-    for (const [code, v] of picks) { watchlist.add(code); map[code] = v.strategy; }
+    // 전략 이름과 함께 백테스트에 실제 쓰인 TF(v.tf) 도 배정에 저장 → 자동매매가
+    // 백테스트와 동일한 타임프레임으로 이 전략을 돌린다.
+    const map: Record<string, { strategy: string; tf: string }> = {};
+    for (const [code, v] of picks) { watchlist.add(code); map[code] = { strategy: v.strategy, tf: v.tf }; }
     symbolStrategies.replace(map);
-    const preview = picks.slice(0, 6).map(([c, v]) => `${c}→${v.strategy}(${v.oos.toFixed(2)}%)`).join(', ');
+    const preview = picks.slice(0, 6).map(([c, v]) => `${c}→${v.strategy}·${v.tf}(${v.oos.toFixed(2)}%)`).join(', ');
     oosSelectMsg = `${picks.length}종목 선정 · 종목별 OOS 순수익 최고 전략 배정 — ${preview}${picks.length > 6 ? ' …' : ''}`;
   }
 
@@ -125,6 +139,13 @@
   $: strategyCols = (matrix?.strategies ?? []) as string[];
   $: tfByStrategy = Object.fromEntries(((matrix?.by_strategy ?? []) as any[]).map((s) => [s.strategy, s.tf]));
   $: perSymbolRows = buildRows(matrix);
+
+  // ── OOS 선정이 실제 자동매매에 반영됐는지 확인 ──
+  // 선정 자체는 watchlist/symbolStrategies 스토어에 즉시 저장되지만, 그 값은
+  // 자동매매 페이지에서 "불러오기 → 시작"을 눌러야 엔진에 반영된다. 이 차이를
+  // 눈으로 바로 확인할 수 있도록 실행 중인 엔진의 워치리스트와 비교해 보여준다.
+  $: engineWatchlist = new Set($tradingStatus.watchlist ?? []);
+  $: notReflectedCodes = $watchlist.filter((c) => !engineWatchlist.has(c));
 
   onMount(loadEbestStatus);
 </script>
@@ -245,8 +266,21 @@
   {#if Object.keys($symbolStrategies).length}
     <div class="bt-assign">배정됨:
       {#each $watchlist.filter((c) => $symbolStrategies[c]) as c}
-        <span class="assign-chip">{c} → <b>{$symbolStrategies[c]}</b></span>
+        <span class="assign-chip">{c} → <b>{$symbolStrategies[c].strategy}</b>{#if $symbolStrategies[c].tf}<em>{$symbolStrategies[c].tf}</em>{/if}</span>
       {/each}
+    </div>
+  {/if}
+  {#if $watchlist.length}
+    <div class="reflect {!$tradingStatus.running ? 'off' : notReflectedCodes.length ? 'warn' : 'ok'}">
+      {#if !$tradingStatus.running}
+        ⚪ 자동매매가 <b>정지</b> 상태입니다 — 선정 결과는 저장되었지만,
+        <a href="/trading">자동매매 페이지</a>에서 <b>불러오기 → 시작</b>을 눌러야 실제로 반영됩니다.
+      {:else if notReflectedCodes.length === 0}
+        🟢 실행 중인 자동매매({$tradingStatus.mode === 'live' ? '실전' : '모의'})에 선정한 {$watchlist.length}종목이 모두 반영되어 있습니다.
+      {:else}
+        🟡 실행 중인 자동매매에 <b>{notReflectedCodes.length}종목이 아직 반영되지 않았습니다</b>: {notReflectedCodes.join(', ')} —
+        <a href="/trading">자동매매 페이지</a>에서 불러오기 후 다시 시작하세요.
+      {/if}
     </div>
   {/if}
 </div>
@@ -284,7 +318,7 @@
               <td>{row.best ? row.best : '—'}</td>
               <td>
                 <button class="star" class:on={$watchlist.includes(row.code)}
-                  on:click={() => { watchlist.toggle(row.code); if (row.best) symbolStrategies.setOne(row.code, row.best); }}
+                  on:click={() => { watchlist.toggle(row.code); if (row.best) symbolStrategies.setOne(row.code, { strategy: row.best, tf: row.cells[row.best]?.tf }); }}
                   title="관심종목 추가/제거 (추가 시 베스트 전략 배정)">{$watchlist.includes(row.code) ? '★' : '☆'}</button>
               </td>
             </tr>
@@ -323,6 +357,12 @@
   .bt-assign { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; font-size: 12px; color: #9399b2; }
   .assign-chip { background: #1e1e2e; border: 1px solid #313244; border-radius: 10px; padding: 2px 8px; }
   .assign-chip b { color: #cba6f7; }
+  .assign-chip em { color: #6c7086; font-style: normal; font-size: 11px; margin-left: 4px; }
+  .reflect { margin-top: 10px; font-size: 12px; padding: 8px 12px; border-radius: 6px; border: 1px solid #45475a; }
+  .reflect a { color: inherit; text-decoration: underline; }
+  .reflect.off { color: #9399b2; background: #1e1e2e; }
+  .reflect.ok { color: #a6e3a1; background: #1a2a1a; border-color: #3a4a3a; }
+  .reflect.warn { color: #f9e2af; background: #2a2717; border-color: #4a4530; }
   .to-trading { margin-left: auto; color: #a6e3a1; text-decoration: none; font-size: 13px; align-self: center; }
   .panel { background: #181825; border-radius: 10px; padding: 12px 16px; margin-top: 4px; }
   .panel.empty { color: #9399b2; font-size: 13px; }

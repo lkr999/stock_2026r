@@ -215,12 +215,12 @@ export const api = {
   // 관심종목 패턴별 통계(참고용)
   batchBacktest: (body: Record<string, unknown>) => jpost<any>(`/api/backtest/batch`, body),
   presets: () => jget<Record<string, any>>(`/api/trading/presets`),
-  tradingStart: (body: Record<string, unknown>, force = false) =>
-    jpost<any>(`/api/trading/start?force=${force}`, body),
+  tradingStart: (body: Record<string, unknown>) => jpost<any>(`/api/trading/start`, body),
   tradingStop: () => jpost<any>(`/api/trading/stop`, {}),
   tradingStatus: () => jget<any>(`/api/trading/status`),
   updateStrategy: (body: Record<string, unknown>) => jput<any>(`/api/trading/strategy`, body),
   readiness: () => jget<ReadinessReport>(`/api/trading/readiness`),
+  accountBalance: () => jget<{ balance: number }>(`/api/trading/balance`),
   journal: (mode = 'paper', limit = 200) => jget<any[]>(`/api/trading/journal?mode=${mode}&limit=${limit}`),
   tradeStats: (mode = 'all') => jget<TradeStats>(`/api/trading/stats?mode=${mode}`),
   closePosition: (code: string) =>

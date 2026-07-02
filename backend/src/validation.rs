@@ -25,8 +25,10 @@ fn paper_stats(trades: &[Value]) -> Value {
     let f = |t: &Value, k: &str| t.get(k).and_then(Value::as_f64).unwrap_or(0.0);
     let rets: Vec<f64> = trades.iter().map(|t| f(t, "return_pct")).collect();
     let pnls: Vec<f64> = trades.iter().map(|t| f(t, "pnl")).collect();
-    let win_sum: f64 = rets.iter().filter(|&&r| r > 0.0).sum();
-    let loss_sum: f64 = rets.iter().filter(|&&r| r <= 0.0).sum();
+    // Money-based profit factor — same basis as `journal.stats()` so the
+    // readiness panel and the stats panel report the same number.
+    let win_sum: f64 = pnls.iter().filter(|&&p| p > 0.0).sum();
+    let loss_sum: f64 = pnls.iter().filter(|&&p| p <= 0.0).sum();
     let pf = if loss_sum != 0.0 {
         win_sum / loss_sum.abs()
     } else if win_sum > 0.0 {

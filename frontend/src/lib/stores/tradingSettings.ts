@@ -13,7 +13,10 @@ export interface TradingSettings {
   orderType: string;
   fixedQty: number;
   sellAll: boolean;
+  /** 모의투자 매수(총 진입금액) 한도액. */
   maxBuyAmount: number;
+  /** 실전투자 매수(총 진입금액) 한도액 — 0이면 아직 계좌 잔고로 초기화되지 않은 상태. */
+  maxBuyAmountLive: number;
   stopLossPct: number;
   takeProfitPct: number;
   lossCooldownBars: number;

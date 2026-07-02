@@ -1,5 +1,6 @@
 //! Cost-aware, look-ahead-safe backtester + walk-forward (spec sections 6-3, 11-1).
 
+use crate::broker::shorting_supported;
 use crate::candle::Candle;
 use crate::indicators::ema_values;
 use crate::pattern::{apply_strategy, compute_atr, detect_setups, PatternDetector, PatternResult};
@@ -144,17 +145,13 @@ pub fn run_strategy_backtest(
     let detector = PatternDetector;
     let rt_cost = cost.round_trip_cost() * 100.0;
     let cost_pct = rt_cost;
-    let rr = if risk.stop_loss_atr_mult != 0.0 {
-        risk.take_profit_atr_mult / risk.stop_loss_atr_mult
-    } else {
-        0.0
-    };
     let n = candles.len();
     // Session-anchored context for VWAP/ORB/EMA setups, precomputed once.
     let ctx = SessionContext::for_tf(candles, tf);
     let ema9 = ema_values(candles, 9);
     let ema20 = ema_values(candles, 20);
     let mut returns: Vec<f64> = vec![];
+    let mut rr_values: Vec<f64> = vec![];
     let mut i = 0;
     while i + 1 < n {
         // Candidate pool = windowed candlestick patterns + context setups.
@@ -162,7 +159,12 @@ pub fn run_strategy_backtest(
         let window = &candles[start..=i];
         let mut cands: Vec<PatternResult> =
             if window.len() >= 13 { detector.scan(window, tf, 0.0, true, cfg, 1) } else { vec![] };
-        let mut setups = detect_setups(candles, i, &ctx, &ema9, &ema20, &cfg.enabled_patterns, cfg.allows_short());
+        // Only simulate bearish/short trades when shorting is actually
+        // executable (see `broker::shorting_supported`) — otherwise the
+        // backtest (and the OOS "tradeable" gate it feeds) would credit a
+        // strategy for trades the engine can never place in paper or live.
+        let short_ok = cfg.allows_short() && shorting_supported();
+        let mut setups = detect_setups(candles, i, &ctx, &ema9, &ema20, &cfg.enabled_patterns, short_ok);
         for s in &mut setups {
             apply_strategy(s, cfg, false, false, false);
         }
@@ -175,7 +177,7 @@ pub fn run_strategy_backtest(
                     && r.composite_score >= cfg.entry_threshold
                     && (!cfg.require_volume_confirm || r.volume_confirmed)
                     && ((r.pattern_type == "bullish" && cfg.allows_long())
-                        || (r.pattern_type == "bearish" && cfg.allows_short()))
+                        || (r.pattern_type == "bearish" && short_ok))
             })
             .max_by(|a, b| a.composite_score.partial_cmp(&b.composite_score).unwrap_or(std::cmp::Ordering::Equal));
         let Some(top) = best else {
@@ -189,22 +191,31 @@ pub fn run_strategy_backtest(
             i += 1;
             continue;
         }
+        // Actual stop/target distances — manual fixed-% takes priority over ATR
+        // multiples, exactly as the live engine places them (risk.stop_and_target).
+        let (stop_dist, target_dist) = risk.stop_target_dists(entry, atr);
+        if stop_dist <= 0.0 {
+            i += 1;
+            continue;
+        }
         // Reward/risk + edge-over-cost gates (same as engine `passes_entry_gates`).
+        let rr = target_dist / stop_dist;
         if cfg.min_reward_risk > 0.0 && rr < cfg.min_reward_risk {
             i += 1;
             continue;
         }
-        let target_move_pct = atr * risk.take_profit_atr_mult / entry * 100.0;
+        let target_move_pct = target_dist / entry * 100.0;
         if cfg.min_edge_over_cost > 0.0 && target_move_pct < cost_pct * cfg.min_edge_over_cost {
             i += 1;
             continue;
         }
         // Direction-aware stop/target/trailing (shorts mirror longs).
         let (stop, target) = if is_short {
-            (entry + atr * risk.stop_loss_atr_mult, entry - atr * risk.take_profit_atr_mult)
+            (entry + stop_dist, entry - target_dist)
         } else {
-            (entry - atr * risk.stop_loss_atr_mult, entry + atr * risk.take_profit_atr_mult)
+            (entry - stop_dist, entry + target_dist)
         };
+        rr_values.push(rr);
         let mut peak = entry; // best excursion: high for longs, low for shorts
         let last_idx = (i + 1 + max_hold_bars).min(n - 1);
         let (mut exit_price, mut exit_idx) = (candles[last_idx].close, last_idx);
@@ -255,7 +266,9 @@ pub fn run_strategy_backtest(
         returns.push(gross - rt_cost);
         i = exit_idx + 1; // resume scanning after the exit (no overlapping positions)
     }
-    summarize(&returns, json!({"strategy": cfg.name, "round_trip_cost_pct": rt_cost, "reward_risk": rr}))
+    // Mean per-entry reward/risk (entries can differ when manual % mixes with ATR).
+    let rr_mean = if rr_values.is_empty() { 0.0 } else { rr_values.iter().sum::<f64>() / rr_values.len() as f64 };
+    summarize(&returns, json!({"strategy": cfg.name, "round_trip_cost_pct": rt_cost, "reward_risk": rr_mean}))
 }
 
 /// Walk-forward (train, test) splits over the candle series (spec section 11-1).

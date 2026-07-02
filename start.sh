@@ -30,15 +30,9 @@ nohup ./target/release/caginalp-trader > "$LOG_DIR/backend.log" 2>&1 &
 BACKEND_PID=$!
 echo "PID $BACKEND_PID | 로그: $LOG_DIR/backend.log"
 
-echo "=== 프론트앤드 시작 (SvelteKit) ==="
-cd "$ROOT/frontend"
-[ -d node_modules ] || npm install
-nohup npm run dev -- --port 7777 > "$LOG_DIR/frontend.log" 2>&1 &
-FRONTEND_PID=$!
-echo "PID $FRONTEND_PID | 로그: $LOG_DIR/frontend.log"
-
-# 백앤드가 실제로 응답할 때까지 대기 (최대 30초)
-echo -n "=== health 대기 "
+# 백앤드가 실제로 응답할 때까지 먼저 대기(최대 30초) — 프론트를 먼저 띄우면
+# Vite의 /api 프록시가 아직 안 뜬 백앤드로 요청을 보내 ECONNREFUSED 가 난다.
+echo -n "=== 백앤드 health 대기 "
 OK=0
 for i in $(seq 1 30); do
   sleep 1
@@ -55,6 +49,13 @@ if [ "$OK" -ne 1 ]; then
   echo ""; echo "오류: 백앤드가 30초 내에 응답하지 않음. 로그 확인:" >&2
   tail -20 "$LOG_DIR/backend.log" >&2; exit 1
 fi
+
+echo "=== 프론트앤드 시작 (SvelteKit) ==="
+cd "$ROOT/frontend"
+[ -d node_modules ] || npm install
+nohup npm run dev -- --port 7777 > "$LOG_DIR/frontend.log" 2>&1 &
+FRONTEND_PID=$!
+echo "PID $FRONTEND_PID | 로그: $LOG_DIR/frontend.log"
 
 echo ""
 echo "Backend  : http://localhost:7001/api/health"

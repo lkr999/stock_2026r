@@ -24,7 +24,30 @@
   let orderType = saved.orderType ?? 'limit';          // limit=지정가 | market=시장가 | best=최유리지정가
   let fixedQty = saved.fixedQty ?? 0;                  // 1회 매수/매도 수량 (0=자동 산정)
   let sellAll = saved.sellAll ?? true;                 // 매도 시 전량
-  let maxBuyAmount = saved.maxBuyAmount ?? 500000;     // 1회 매수 한도액
+  // 매수 한도액 = 총 진입금액(보유 포지션 전체 합계) 한도. 모의/실전 모드별로 값을
+  // 분리 저장한다 — 실전은 잔고금액을, 모의는 이 값을 기본값으로 쓴다.
+  let maxBuyAmount = saved.maxBuyAmount ?? 500000;         // 모의투자용
+  let maxBuyAmountLive = saved.maxBuyAmountLive ?? 0;      // 실전투자용 (0 = 아직 계좌 잔고로 초기화 전)
+  let liveBalanceLoading = false;
+  // 실전 모드로 처음 진입할 때 잔고금액을 조회해 기본값으로 채운다. 이미 값이
+  // 있으면(사용자가 조정했거나 이전에 조회됨) 덮어쓰지 않는다.
+  async function ensureLiveBalanceDefault(force = false) {
+    if (liveBalanceLoading || (!force && maxBuyAmountLive > 0)) return;
+    liveBalanceLoading = true;
+    try {
+      const { balance } = await api.accountBalance();
+      if (balance > 0) maxBuyAmountLive = Math.floor(balance);
+    } catch {
+      // 계좌 조회 실패(키 미설정 등) — 조용히 무시, 사용자가 직접 입력 가능
+    } finally {
+      liveBalanceLoading = false;
+    }
+  }
+  function selectMode(m: string) {
+    mode = m;
+    if (m === 'live') ensureLiveBalanceDefault();
+  }
+  $: activeMaxBuyAmount = mode === 'live' ? maxBuyAmountLive : maxBuyAmount;
 
   // 손절·익절 설정 (수동 고정%; 0 = ATR 변동성 기준 자동)
   let stopLossPct = saved.stopLossPct ?? 0;            // 매수가 대비 손절 % (예: 3 → -3%)
@@ -49,6 +72,13 @@
     const codes = get(watchlist);
     if (codes.length) watchlistText = codes.join(', ');
   }
+
+  // 대시보드(OOS 순수익 기준 선정)에서 정한 관심종목이 이 페이지의 입력값과 다른지 확인한다.
+  // watchlistText는 별도로 저장되는 값이라 대시보드에서 새로 선정해도 자동 반영되지 않으므로,
+  // "불러오기"를 눌러야 함을 눈에 띄게 알려준다.
+  $: watchlistCodes = watchlistText.split(',').map((s) => s.trim()).filter(Boolean);
+  $: watchlistStale = $watchlist.length > 0 &&
+    ($watchlist.length !== watchlistCodes.length || $watchlist.some((c) => !watchlistCodes.includes(c)));
 
   let status: any = { running: false, positions: [], daily_pnl: 0, trade_events: [] };
   let presets: Record<string, any> = {};
@@ -89,7 +119,7 @@
   // 설정값이 바뀔 때마다 localStorage에 저장 → 다음 방문 시 기본값으로 유지된다.
   $: saveTradingSettings({
     mode, strategy, tf, watchlistText, pollSec, ignoreHours,
-    orderType, fixedQty, sellAll, maxBuyAmount,
+    orderType, fixedQty, sellAll, maxBuyAmount, maxBuyAmountLive,
     stopLossPct, takeProfitPct,
     lossCooldownBars, reentryCooldownBars, reentryGapPct, fibEnabled, fibMaxLevels,
     requireConfirmation, requireHigherTfUptrend, minHoldBars, hardStopIntrabar, hardStopBufferPct,
@@ -130,15 +160,19 @@
     } catch {}
   }
 
-  // 포지션별 실시간 현재가/미실현손익 — livePrices 우선, 없으면 엔진 값
+  // 포지션별 실시간 현재가/미실현손익 — livePrices 우선, 없으면 엔진 값.
+  // 숏 포지션은 가격이 내려야 수익이므로 방향(dir)을 반영한다.
   function liveCur(p: any): number {
     return livePrices[p.code] ?? p.current_price ?? p.entry;
   }
+  function posDir(p: any): number {
+    return p.side === 'short' ? -1 : 1;
+  }
   function liveUpnl(p: any): number {
-    return (liveCur(p) - p.entry) * p.qty;
+    return (liveCur(p) - p.entry) * p.qty * posDir(p);
   }
   function liveUpct(p: any): number {
-    return p.entry ? (liveCur(p) - p.entry) / p.entry * 100 : 0;
+    return p.entry ? ((liveCur(p) - p.entry) / p.entry) * 100 * posDir(p) : 0;
   }
   // 평균매수단가 (물타기 시 수량가중 평균으로 갱신됨)
   function avgPrice(p: any): number {
@@ -152,17 +186,35 @@
   function totalEval(p: any): number {
     return liveCur(p) * p.qty;
   }
-  // 실시간 평가자산/미실현 합계
+  // 실시간 평가자산/미실현 합계 — 백엔드 equity()와 동일하게 숏은 미실현손익만 가산
+  // (숏 진입은 현금을 쓰지도 받지도 않으므로 qty×현재가로 더하면 자산이 부풀려진다).
   $: positions = status.positions ?? [];
-  $: liveEquity = (status.cash ?? 0) + positions.reduce((s: number, p: any) => s + p.qty * liveCur(p), 0);
+  $: liveEquity =
+    (status.cash ?? 0) +
+    positions.reduce(
+      (s: number, p: any) => s + (p.side === 'short' ? (p.entry - liveCur(p)) * p.qty : p.qty * liveCur(p)),
+      0
+    );
   $: liveUnrealTotal = positions.reduce((s: number, p: any) => s + liveUpnl(p), 0);
+
+  // 보유 포지션 합계 (수량·총매수금액·총평가금액·미실현손익) — 표 하단 합계 행/강조 박스에 사용.
+  $: totalQty = positions.reduce((s: number, p: any) => s + p.qty, 0);
+  $: totalBuyAmt = positions.reduce((s: number, p: any) => s + totalBuy(p), 0);
+  $: totalEvalAmt = positions.reduce((s: number, p: any) => s + totalEval(p), 0);
+  $: totalUpct = totalBuyAmt ? (liveUnrealTotal / totalBuyAmt) * 100 : 0;
+
+  // 총매수금액 합계 vs 매수 한도액(총 진입금액 한도) — 실행 중이면 엔진에 적용된 한도, 아니면 설정 폼의 값을 기준으로 비교.
+  $: buyLimit = cfgOrder?.max_buy_amount ?? activeMaxBuyAmount;
+  $: buyLimitDiff = totalBuyAmt - buyLimit;
+  $: buyLimitRatio = buyLimit > 0 ? (totalBuyAmt / buyLimit) * 100 : 0;
 
   let closing: Record<string, boolean> = {};
   async function closePosition(p: any) {
     const live = status.mode === 'live';
+    const closeWord = p.side === 'short' ? '청산(매수 환매)' : '청산(매도)';
     const msg = live
       ? `[실전] ${p.name || p.code} ${p.qty}주를 실제 시장가/지정가로 청산 주문합니다. 계속할까요?`
-      : `${p.name || p.code} ${p.qty}주를 현재가로 청산(매도)합니다. 계속할까요?`;
+      : `${p.name || p.code} ${p.qty}주를 현재가로 ${closeWord}합니다. 계속할까요?`;
     if (!confirm(msg)) return;
     closing = { ...closing, [p.code]: true };
     try {
@@ -200,7 +252,7 @@
           ...((status.positions ?? []) as any[]).map((p) => p.code as string),
         ])
       )
-    : watchlistText.split(',').map((s: string) => s.trim()).filter(Boolean);
+    : watchlistCodes;
 
   $: tradeEvents = (status.trade_events ?? []) as TradeEvent[];
 
@@ -218,9 +270,14 @@
     try {
       const wl = watchlistText.split(',').map((s: string) => s.trim()).filter(Boolean);
       // 대시보드의 백테스트 선정에서 배정된 종목별 전략을 함께 전달 (배정 없는 종목은 전역 전략 사용).
+      // 배정에 저장된 TF(백테스트에 실제 쓰인 타임프레임)를 recommended_tf 로 넘겨,
+      // 자동매매가 백테스트와 동일한 TF 로 그 전략을 돌리도록 한다.
       const assigned = get(symbolStrategies);
-      const symMap: Record<string, string> = {};
-      for (const c of wl) if (assigned[c]) symMap[c] = assigned[c];
+      const symMap: Record<string, { name: string; recommended_tf?: string }> = {};
+      for (const c of wl) {
+        const a = assigned[c];
+        if (a) symMap[c] = a.tf ? { name: a.strategy, recommended_tf: a.tf } : { name: a.strategy };
+      }
       const resStart = await api.tradingStart({
         mode, strategy: { name: strategy, weights, entry_threshold: entryThreshold },
         symbol_strategies: symMap,
@@ -229,7 +286,7 @@
           order_type: orderType,
           fixed_qty: fixedQty,
           sell_all: sellAll,
-          max_buy_amount: maxBuyAmount,
+          max_buy_amount: activeMaxBuyAmount,
         },
         require_tradeable: requireTradeable,
         risk: {
@@ -265,10 +322,32 @@
 
   onMount(() => {
     loadPresets(); refreshStatus(); refreshReadiness(); refreshJournal();
+    if (mode === 'live') ensureLiveBalanceDefault();
     timer = setInterval(() => { refreshStatus(); refreshReadiness(); }, 5000);
   });
   onDestroy(() => clearInterval(timer));
 
+  // 세션 거래 이벤트의 구분 라벨: 진입/청산 × 롱/숏.
+  // 숏은 진입이 매도(신규매도), 청산이 매수(환매)라서 type(매수/매도)만 보여주면
+  // 보유 포지션과 매칭이 안 된다 — action/side 로 명확히 표기한다.
+  function evLabel(ev: TradeEvent): string {
+    if (!ev.action) return ev.type === 'buy' ? '매수' : '매도'; // 물타기 등 구분 없는 이벤트
+    if (ev.side === 'short') return ev.action === 'open' ? '숏 진입(매도)' : '숏 청산(매수)';
+    return ev.action === 'open' ? '롱 진입(매수)' : '롱 청산(매도)';
+  }
+  // 실현손익은 '청산' 이벤트에만 있다. 숏 청산은 type=buy 이므로 type 으로
+  // 판단하면 숏의 실현손익이 숨고 숏 진입에 0원이 표시된다.
+  function evIsClose(ev: TradeEvent): boolean {
+    return ev.action ? ev.action === 'close' : ev.type === 'sell';
+  }
+  // 구분 컬럼 색상: 진입(open)만 매수(빨강)/매도(파랑)로 칠하고, 청산(close)은
+  // 방향이 아니라 손익 결과(초록/분홍)로 칠한다. 진입·청산에 같은 매수 텍스트+
+  // 빨간색이 쓰이면 "매수=보유중"으로 오인해 청산 건이 보유 포지션에 없는 게
+  // 버그처럼 보인다 — 색을 분리해 진입/청산을 한눈에 구분되게 한다.
+  function evTagClass(ev: TradeEvent): string {
+    if (evIsClose(ev)) return ev.pnl >= 0 ? 'exit-pos' : 'exit-neg';
+    return ev.type === 'buy' ? 'buy-tag' : 'sell-tag';
+  }
   function fmtPnl(v: number) {
     return (v >= 0 ? '+' : '') + Math.round(v).toLocaleString() + '원';
   }
@@ -284,7 +363,7 @@
     if (phase === '진입') return 'ph-enter';
     if (phase === '보유중') return 'ph-hold';
     if (phase === '쿨다운' || phase === '재매수가드') return 'ph-cool';
-    if (phase === '확인봉대기' || phase === '게이트미달' || phase === '상위TF하락') return 'ph-gate';
+    if (phase === '확인봉대기' || phase === '게이트미달' || phase === '상위TF역행' || phase === '숏차단') return 'ph-gate';
     if (phase === '진입제한' || phase === '주문실패' || phase === '수량부족') return 'ph-block';
     return 'ph-idle';
   }
@@ -294,6 +373,14 @@
   $: cfgRisk = status.risk ?? null;
   $: cfgOrder = status.order ?? null;
   $: symStratEntries = Object.entries((status.symbol_strategies ?? {}) as Record<string, { strategy: string; tf: string }>);
+  // 모니터링 종목에 실제 적용되는 전략: 종목별 배정이 있으면 그것을, 없으면 전역 전략을 쓴다.
+  function monitorStrategy(code: string): { strategy: string; tf: string; assigned: boolean } {
+    const sym = (status.symbol_strategies ?? {}) as Record<string, { strategy: string; tf: string }>;
+    const s = sym[code];
+    if (s) return { strategy: s.strategy, tf: s.tf, assigned: true };
+    // 백엔드 status 는 'timeframe' 키로 내려준다 ('tf' 아님).
+    return { strategy: status.strategy ?? strategy, tf: status.timeframe ?? tf, assigned: false };
+  }
   $: cfgWeights = (status.weights ?? weights) as Record<string, number>;
   $: activeWeights = sources
     .map((s) => [s, cfgWeights[s] ?? 0] as [string, number])
@@ -305,7 +392,13 @@
   }
 </script>
 
-<h1>자동매매 컨트롤</h1>
+<h1>
+  자동매매 컨트롤
+  <span class="run-pill {status.running ? (status.mode === 'live' ? 'live' : 'paper') : 'off'}">
+    <span class="dot"></span>
+    {status.running ? `${status.mode === 'live' ? '실전' : '모의'} 실행중 · 사이클 ${status.cycles ?? 0}회` : '정지 상태'}
+  </span>
+</h1>
 <p class="warn">
   ℹ️ <b>모의투자</b>와 <b>실전투자</b>의 차이는 <b>주문 체결 방식뿐</b>입니다 — 시그널 감지·리스크 관리·포지션 추적은 동일.
   <br>• <b>모의투자</b>: 시그널 발생 시 <b>현재가로 즉시 체결(시뮬레이션)</b>
@@ -320,8 +413,8 @@
     <div class="row">
       <label>모드</label>
       <div class="seg">
-        <button class:active={mode==='paper'} on:click={() => mode='paper'}>모의투자</button>
-        <button class:active={mode==='live'} on:click={() => mode='live'} class:danger={mode==='live'}
+        <button class:active={mode==='paper'} on:click={() => selectMode('paper')}>모의투자</button>
+        <button class:active={mode==='live'} on:click={() => selectMode('live')} class:danger={mode==='live'}
           title={report?.ready ? '검증 완료' : '검증 미달 (참고) — 모드 선택은 자유'}>
           실전투자 {#if report && !report.ready}⚠️{/if}
         </button>
@@ -336,8 +429,17 @@
     <div class="row">
       <label>관심종목</label>
       <input bind:value={watchlistText} placeholder="콤마 구분 종목코드" />
-      <button class="mini" on:click={loadFromWatchlist} title="대시보드에서 선택한 관심종목 불러오기">★ 불러오기 ({$watchlist.length})</button>
+      <button class="mini" class:stale={watchlistStale} on:click={loadFromWatchlist}
+        title="대시보드에서 선택한 관심종목 불러오기">
+        {watchlistStale ? '⚠ 대시보드 선정 반영' : '★ 불러오기'} ({$watchlist.length})
+      </button>
     </div>
+    {#if watchlistStale}
+      <p class="stale-hint">
+        ⚠️ 대시보드에서 선정한 관심종목이 위 입력값과 다릅니다. <b>불러오기</b>를 누르지 않으면
+        기존 종목으로 시작/재구성됩니다 — 새로 선정한 종목·전략을 적용하려면 먼저 눌러주세요.
+      </p>
+    {/if}
     <div class="row"><label>폴링(초)</label><input type="number" bind:value={pollSec} min="2" /></div>
     <div class="row"><label>장시간 무시</label><input type="checkbox" bind:checked={ignoreHours} /></div>
     <div class="actions">
@@ -366,9 +468,21 @@
       <span class="unit">주</span>
     </div>
     <div class="row">
-      <label>매수 한도액</label>
-      <input type="number" bind:value={maxBuyAmount} min="0" step="100000" />
-      <span class="unit">원/회</span>
+      <label title="보유 포지션 전체(롱+숏) 진입금액 합계에 대한 한도 — 1회 주문 한도가 아닙니다">
+        {mode === 'live' ? '매수 한도액 (실전)' : '매수 한도액 (모의)'}
+      </label>
+      {#if mode === 'live'}
+        <input type="number" bind:value={maxBuyAmountLive} min="0" step="100000" />
+      {:else}
+        <input type="number" bind:value={maxBuyAmount} min="0" step="100000" />
+      {/if}
+      <span class="unit">원</span>
+      {#if mode === 'live'}
+        <button class="mini" type="button" disabled={liveBalanceLoading} on:click={() => ensureLiveBalanceDefault(true)}
+          title="계좌 잔고를 다시 조회해 한도액에 채웁니다">
+          {liveBalanceLoading ? '조회중…' : '↻ 잔고 불러오기'}
+        </button>
+      {/if}
     </div>
     <div class="row">
       <label>매도 방식</label>
@@ -376,7 +490,9 @@
     </div>
     <p class="hint">
       1회 수량 0이면 리스크 기준(자본 1%·ATR)으로 자동 산정합니다.
-      매수는 한도액({maxBuyAmount.toLocaleString()}원)과 가용현금 중 작은 값으로 제한됩니다.
+      매수 한도액은 <b>1회 주문이 아니라 보유 포지션 전체의 진입금액 합계</b>에 대한 한도이며,
+      새 진입은 (한도액 − 현재 총 진입금액)과 가용현금 중 작은 값으로 제한됩니다.
+      {#if mode === 'live'}실전투자는 기본값으로 현재 계좌 잔고({activeMaxBuyAmount.toLocaleString()}원)를 사용합니다.{/if}
       {#if !sellAll && fixedQty > 0}<br>※ 전량매도 해제 + 1회수량 설정 시, 청산 신호에 {fixedQty}주씩 부분 매도합니다.{/if}
     </p>
   </section>
@@ -500,7 +616,12 @@
           <h5>실행</h5>
           <dl>
             <div><dt>전략</dt><dd>{status.strategy ?? strategy}</dd></div>
-            <div><dt>방향</dt><dd>{status.direction ?? '-'}</dd></div>
+            <div><dt>방향</dt><dd>
+              {status.direction ?? '-'}
+              {#if status.direction === 'both' || status.direction === 'short_only'}
+                <span class="sub-note">— 숏 신호는 감지만 되고 진입은 항상 차단됩니다 (모의·실전 공통, 공매도 미지원)</span>
+              {/if}
+            </dd></div>
             <div><dt>타임프레임</dt><dd>{status.timeframe ?? tf}</dd></div>
             <div><dt>진입 임계</dt><dd>{(status.entry_threshold ?? entryThreshold).toFixed(2)}</dd></div>
             <div><dt>폴링 주기</dt><dd>{status.poll_sec ?? pollSec}초</dd></div>
@@ -527,7 +648,7 @@
           <dl>
             <div><dt>주문유형</dt><dd>{orderTypeLabel(cfgOrder.order_type)}</dd></div>
             <div><dt>1회 수량</dt><dd>{cfgOrder.fixed_qty ? cfgOrder.fixed_qty + '주' : '자동(리스크 기준)'}</dd></div>
-            <div><dt>매수 한도액</dt><dd>{Math.round(cfgOrder.max_buy_amount).toLocaleString()}원/회</dd></div>
+            <div><dt>매수 한도액</dt><dd>{Math.round(cfgOrder.max_buy_amount).toLocaleString()}원 (총 진입금액 한도)</dd></div>
             <div><dt>매도 방식</dt><dd>{cfgOrder.sell_all ? '전량매도' : '부분매도'}</dd></div>
           </dl>
         </div>
@@ -587,18 +708,24 @@
       </div>
     {/if}
 
-    <h4>모니터링 현황 ({monitorRows.length}) <span class="sub-note">— 각 종목을 매 사이클 어떻게 평가하고 있는지 (마지막 판정 기준)</span></h4>
+    <h4>모니터링 현황 ({monitorRows.length}) <span class="sub-note">— 각 종목에 적용 중인 전략(적용전략)과 매 사이클 판정 결과 (마지막 판정 기준)</span></h4>
     <table>
       <thead>
         <tr>
-          <th>종목</th><th>코드</th><th>상태</th><th>감지패턴</th><th>점수</th><th>종가</th><th>현재가</th><th>판정 사유</th><th>갱신</th>
+          <th>종목</th><th>코드</th><th>적용전략</th><th>상태</th><th>감지패턴</th><th>점수</th><th>종가</th><th>현재가</th><th>판정 사유</th><th>갱신</th>
         </tr>
       </thead>
       <tbody>
         {#each monitorRows as m}
+          {@const ms = monitorStrategy(m.code)}
           <tr>
             <td><strong>{m.name || '-'}</strong></td>
             <td class="cd">{m.code}</td>
+            <td class="strat">
+              <span class="strat-name" class:global={!ms.assigned}>{ms.strategy}</span>
+              <em class="strat-tf">{ms.tf}</em>
+              {#if !ms.assigned}<span class="strat-badge" title="종목별 배정 없음 — 전역 전략 적용">전역</span>{/if}
+            </td>
             <td><span class="phase {phaseClass(m.phase)}">{m.phase}</span></td>
             <td class="sig">{m.pattern || '-'}</td>
             <td class="num">{m.score != null ? m.score.toFixed(3) : '-'}</td>
@@ -609,19 +736,19 @@
           </tr>
         {/each}
         {#if monitorRows.length === 0}
-          <tr><td colspan="9" class="empty">
+          <tr><td colspan="10" class="empty">
             {status.running ? '첫 사이클 평가 대기 중…' : '정지 상태 — 시작하면 종목별 모니터링이 표시됩니다'}
           </td></tr>
         {/if}
       </tbody>
     </table>
 
-    <h4>보유 포지션 ({status.positions?.length ?? 0}) <span class="sub-note">— 실제 매수 시그널로 체결된 보유분 (평균매수단가 기준 분석)</span></h4>
+    <h4>보유 포지션 ({status.positions?.length ?? 0}) <span class="sub-note">— 진입 시그널로 체결된 보유분 (평균 진입단가 기준 분석)</span></h4>
     <table>
       <thead>
         <tr>
-          <th>종목</th><th>코드</th><th>매수신호</th><th>진입시각</th><th>수량</th>
-          <th>평균단가</th><th>총 매수금액</th><th>현재가</th><th>총 평가금액</th>
+          <th>종목</th><th>코드</th><th>구분</th><th>진입신호</th><th>진입시각</th><th>수량</th>
+          <th>평균단가</th><th>총 진입금액</th><th>현재가</th><th>총 평가금액</th>
           <th>미실현손익</th><th>수익률</th><th>손절</th><th>익절</th><th>청산</th>
         </tr>
       </thead>
@@ -630,6 +757,7 @@
           <tr>
             <td><strong>{p.name || '-'}</strong></td>
             <td class="cd">{p.code}</td>
+            <td class={p.side === 'short' ? 'sell-tag' : 'buy-tag'}>{p.side === 'short' ? '숏' : '롱'}</td>
             <td class="sig">{p.pattern || '-'}</td>
             <td class="cd">{fmtTime(p.opened_at)}</td>
             <td class="num">{p.qty}</td>
@@ -643,15 +771,44 @@
             <td class="num pos">{Math.round(p.target).toLocaleString()}</td>
             <td class="ctd">
               <button class="close-pos" disabled={closing[p.code]} on:click={() => closePosition(p)}
-                title="이 종목을 전량 청산(매도)합니다">
+                title={p.side === 'short' ? '이 종목을 전량 청산(매수 환매)합니다' : '이 종목을 전량 청산(매도)합니다'}>
                 {closing[p.code] ? '…' : '✕ 청산'}
               </button>
             </td>
           </tr>
         {/each}
-        {#if positions.length === 0}<tr><td colspan="14" class="empty">보유 없음 — 매수 시그널 발생 시 자동 진입됩니다</td></tr>{/if}
+        {#if positions.length === 0}<tr><td colspan="15" class="empty">보유 없음 — 진입 시그널 발생 시 자동 진입됩니다</td></tr>{/if}
       </tbody>
+      {#if positions.length > 0}
+        <tfoot>
+          <tr class="totals-row">
+            <td colspan="5">합계 ({positions.length}종목)</td>
+            <td class="num">{totalQty}</td>
+            <td class="num">-</td>
+            <td class="num">{Math.round(totalBuyAmt).toLocaleString()}</td>
+            <td class="num">-</td>
+            <td class="num">{Math.round(totalEvalAmt).toLocaleString()}</td>
+            <td class="num {liveUnrealTotal >= 0 ? 'pos' : 'neg'}">{fmtPnl(liveUnrealTotal)}</td>
+            <td class="num {totalUpct >= 0 ? 'pos' : 'neg'}">{fmtPct(totalUpct)}</td>
+            <td colspan="3"></td>
+          </tr>
+        </tfoot>
+      {/if}
     </table>
+
+    {#if positions.length > 0}
+      <div class="limit-compare {buyLimitDiff > 0 ? 'over' : 'under'}">
+        <span class="lc-label">총매수금액 합계</span>
+        <span class="lc-val">{Math.round(totalBuyAmt).toLocaleString()}원</span>
+        <span class="lc-vs">vs</span>
+        <span class="lc-label">매수 한도액 (총 진입금액)</span>
+        <span class="lc-val">{Math.round(buyLimit).toLocaleString()}원</span>
+        <span class="lc-diff">
+          차이 <b>{buyLimitDiff >= 0 ? '+' : ''}{Math.round(buyLimitDiff).toLocaleString()}원</b>
+          · <b>{buyLimitRatio.toFixed(0)}%</b>{buyLimitRatio > 100 ? ` (한도 ${(buyLimitRatio / 100).toFixed(1)}배)` : ''}
+        </span>
+      </div>
+    {/if}
 
     {#if tradeEvents.length > 0}
       <div class="h4row">
@@ -665,11 +822,11 @@
             <tr>
               <td class="cd">{ev.time_label}</td>
               <td><strong>{ev.name || ev.code}</strong><span class="cd"> {ev.code}</span></td>
-              <td class={ev.type === 'buy' ? 'buy-tag' : 'sell-tag'}>{ev.type === 'buy' ? '매수' : '매도'}</td>
+              <td class={evTagClass(ev)}>{evLabel(ev)}</td>
               <td class="num">{ev.qty.toLocaleString()}</td>
               <td class="num">{Math.round(ev.price).toLocaleString()}</td>
-              <td class="num {ev.pnl >= 0 ? 'pos' : 'neg'}">{ev.type === 'sell' ? fmtPnl(ev.pnl) : '-'}</td>
-              <td class="num {ev.pnl_pct >= 0 ? 'pos' : 'neg'}">{ev.type === 'sell' ? fmtPct(ev.pnl_pct) : '-'}</td>
+              <td class="num {ev.pnl >= 0 ? 'pos' : 'neg'}">{evIsClose(ev) ? fmtPnl(ev.pnl) : '-'}</td>
+              <td class="num {ev.pnl_pct >= 0 ? 'pos' : 'neg'}">{evIsClose(ev) ? fmtPct(ev.pnl_pct) : '-'}</td>
               <td class="cd">{ev.reason}</td>
             </tr>
           {/each}
@@ -716,13 +873,15 @@
     <div class="journal-scroll">
       <table>
         <thead>
-          <tr><th>청산시간</th><th>종목</th><th>패턴</th><th>수량</th><th>진입가</th><th>청산가</th><th>실현손익</th><th>수익률</th><th>사유</th></tr>
+          <tr><th>청산시간</th><th>종목</th><th>구분</th><th>패턴</th><th>수량</th><th>진입가</th><th>청산가</th><th>실현손익</th><th>수익률</th><th>사유</th></tr>
         </thead>
         <tbody>
           {#each journalTrades as t}
             <tr>
               <td class="cd">{(t.closed_at || '').slice(0, 16).replace('T', ' ')}</td>
               <td class="cd">{t.code}</td>
+              <td class={t.side === 'short' ? 'sell-tag' : t.side === 'long' ? 'buy-tag' : 'cd'}>
+                {t.side === 'short' ? '숏' : t.side === 'long' ? '롱' : '-'}</td>
               <td class="cd">{t.pattern || '-'}</td>
               <td class="num">{t.qty}</td>
               <td class="num">{Math.round(t.entry).toLocaleString()}</td>
@@ -745,7 +904,16 @@
 </section>
 
 <style>
-  h1 { font-size: 22px; margin: 0 0 6px; }
+  h1 { font-size: 22px; margin: 0 0 6px; display: flex; align-items: center; gap: 12px; }
+  .run-pill {
+    display: inline-flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 700;
+    padding: 4px 12px; border-radius: 12px; background: #313244; color: #9399b2; border: 1px solid #45475a;
+  }
+  .run-pill .dot { width: 8px; height: 8px; border-radius: 50%; background: #6c7086; }
+  .run-pill.paper { color: #a6e3a1; border-color: #3a4a3a; }
+  .run-pill.paper .dot { background: #a6e3a1; box-shadow: 0 0 6px #a6e3a1; }
+  .run-pill.live { color: #f38ba8; border-color: #4a2f36; }
+  .run-pill.live .dot { background: #f38ba8; box-shadow: 0 0 6px #f38ba8; }
   .warn { background: #313244; color: #f9e2af; padding: 8px 12px; border-radius: 6px; font-size: 12px; margin-bottom: 16px; }
   .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
   .card { background: #181825; border-radius: 10px; padding: 16px; }
@@ -766,6 +934,8 @@
   .start, .stop, .hot { border: none; border-radius: 6px; padding: 9px 20px; font-weight: 700; cursor: pointer; }
   .gate-note { margin-left: 12px; font-size: 12px; color: #f9e2af; }
   .mini { background: #313244; color: #cdd6f4; border: none; border-radius: 4px; padding: 6px 10px; cursor: pointer; font-size: 12px; white-space: nowrap; }
+  .mini.stale { background: #f9e2af; color: #1e1e2e; font-weight: 700; }
+  .stale-hint { font-size: 12px; color: #f9e2af; background: #2a2717; border: 1px solid #45475a; border-radius: 6px; padding: 6px 10px; margin: -2px 0 10px; }
   .cd { color: #6c7086; font-size: 11px; }
   .charts { margin-top: 16px; }
   .charts h3 { margin: 0 0 4px; font-size: 15px; }
@@ -809,6 +979,14 @@
   .sym-chip { background: #1e1e2e; border: 1px solid #313244; border-radius: 10px; padding: 2px 8px; font-size: 12px; }
   .sym-chip b { color: #cba6f7; }
   .sym-chip em { color: #6c7086; font-style: normal; font-size: 11px; }
+  .strat { white-space: nowrap; }
+  .strat-name { color: #cba6f7; font-weight: 600; font-size: 12px; }
+  .strat-name.global { color: #9399b2; font-weight: 500; }
+  .strat-tf { color: #6c7086; font-style: normal; font-size: 11px; margin-left: 4px; }
+  .strat-badge {
+    margin-left: 4px; padding: 1px 5px; border-radius: 8px;
+    font-size: 10px; color: #6c7086; background: #1e1e2e; border: 1px solid #313244;
+  }
   .detail { color: #bac2de; font-size: 11px; }
   .phase {
     display: inline-block; padding: 2px 8px; border-radius: 10px;
@@ -828,6 +1006,21 @@
   .close-pos:hover:not(:disabled) { background: #f38ba8; color: #1e1e2e; }
   .close-pos:disabled { opacity: 0.5; cursor: progress; }
   .liveat { font-size: 11px; color: #6c7086; align-self: center; }
+  .totals-row { background: #1e1e2e; font-weight: 700; }
+  .totals-row td { border-top: 2px solid #45475a; border-bottom: none; }
+  .totals-row td:first-child { color: #9399b2; font-weight: 600; }
+  .limit-compare {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    margin-top: 10px; padding: 10px 14px; border-radius: 8px; font-size: 13px;
+    background: #1e1e2e; border: 1px solid #45475a;
+  }
+  .limit-compare .lc-label { color: #9399b2; }
+  .limit-compare .lc-val { font-weight: 700; color: #cdd6f4; }
+  .limit-compare .lc-vs { color: #6c7086; font-size: 11px; }
+  .limit-compare .lc-diff { margin-left: auto; font-size: 13px; }
+  .limit-compare.over { border-color: #4a2f36; }
+  .limit-compare.over .lc-diff { color: #f38ba8; }
+  .limit-compare.under .lc-diff { color: #a6e3a1; }
   .h4row { display: flex; justify-content: space-between; align-items: center; }
   .h4row h4 { margin: 16px 0 8px; }
   .hdr-right { display: flex; align-items: center; gap: 10px; }
@@ -840,6 +1033,10 @@
   .error, .err { background: #f38ba8; color: #1e1e2e; padding: 8px; border-radius: 6px; font-size: 12px; margin-top: 8px; }
   .buy-tag { color: #ef4444; font-weight: 700; }
   .sell-tag { color: #3b82f6; font-weight: 700; }
+  /* 청산(close) 이벤트는 진입(open)과 다른 색 계열(초록/분홍)로 — 매수/매도의
+     빨강/파랑과 겹치지 않게 해 "청산도 보유 중"이라는 오독을 막는다. */
+  .exit-pos { color: #a6e3a1; font-weight: 700; }
+  .exit-neg { color: #f38ba8; font-weight: 700; }
   /* 집계 통계 */
   .stats-card { margin-top: 16px; }
   .stats-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }

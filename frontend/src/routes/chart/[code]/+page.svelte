@@ -7,7 +7,7 @@
   import CandleChart from '$lib/components/CandleChart.svelte';
   import CompositeScoreBar from '$lib/components/CompositeScoreBar.svelte';
 
-  $: code = $page.params.code;
+  $: code = $page.params.code ?? '';
   let candles: Candle[] = [];
   let patterns: PatternResult[] = [];
   let name = '';
@@ -16,6 +16,7 @@
   let dataSource: 'live' | '' = '';
 
   async function load() {
+    if (!code) return;
     loading = true; error = '';
     try {
       const [c, p] = await Promise.all([

@@ -41,6 +41,9 @@ pub struct Settings {
     pub trading_order_type: String,
     pub trading_fixed_qty: i64,
     pub trading_sell_all: bool,
+    /// Cap on total entered amount across all open positions (portfolio-wide,
+    /// not per order). The frontend defaults this to the live account balance
+    /// when trading live, and to this env value in paper mode.
     pub trading_max_buy_amount: f64,
     // Live-trading readiness advisory thresholds (spec section 11-2)
     pub live_min_paper_trades: usize,

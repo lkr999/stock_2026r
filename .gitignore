@@ -29,3 +29,6 @@ pnpm-debug.log*
 .claude/
 .idea/
 .vscode/
+
+# Runtime data (trade journal is written on every closed trade)
+backend/data/trade_journal.json
