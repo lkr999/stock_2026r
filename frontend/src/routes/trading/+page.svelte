@@ -18,12 +18,16 @@
   const initialWatch = get(watchlist);
   let watchlistText = saved.watchlistText ?? (initialWatch.length ? initialWatch.join(', ') : '005930, 000660, 035420');
   let pollSec = saved.pollSec ?? 60;
-  let ignoreHours = saved.ignoreHours ?? true;
+  // 기본 false — 장시간 무시가 기본값이면 주말/장외에 스테일 봉으로 엔진이 돌아
+  // 금요일 마지막 봉을 새 봉으로 오인하는 진입이 생길 수 있다 (테스트 시에만 수동 ON).
+  // 실전 모드에서는 항상 강제 해제 (저장값이 live+ON 조합이어도).
+  let ignoreHours = (saved.mode ?? 'paper') === 'live' ? false : (saved.ignoreHours ?? false);
 
   // 주문 설정
   let orderType = saved.orderType ?? 'limit';          // limit=지정가 | market=시장가 | best=최유리지정가
   let fixedQty = saved.fixedQty ?? 0;                  // 1회 매수/매도 수량 (0=자동 산정)
   let sellAll = saved.sellAll ?? true;                 // 매도 시 전량
+  let maxPositions = saved.maxPositions ?? 10;         // 동시 보유 최대 종목 수
   // 매수 한도액 = 총 진입금액(보유 포지션 전체 합계) 한도. 모의/실전 모드별로 값을
   // 분리 저장한다 — 실전은 잔고금액을, 모의는 이 값을 기본값으로 쓴다.
   let maxBuyAmount = saved.maxBuyAmount ?? 500000;         // 모의투자용
@@ -36,7 +40,9 @@
     liveBalanceLoading = true;
     try {
       const { balance } = await api.accountBalance();
-      if (balance > 0) maxBuyAmountLive = Math.floor(balance);
+      // 기본값은 잔고의 50%만 — 전액을 한도로 잡으면 첫 실행부터 계좌 전체가
+      // 리스크에 노출된다. 사용자가 원하면 직접 올릴 수 있다.
+      if (balance > 0) maxBuyAmountLive = Math.floor(balance * 0.5);
     } catch {
       // 계좌 조회 실패(키 미설정 등) — 조용히 무시, 사용자가 직접 입력 가능
     } finally {
@@ -45,7 +51,11 @@
   }
   function selectMode(m: string) {
     mode = m;
-    if (m === 'live') ensureLiveBalanceDefault();
+    if (m === 'live') {
+      ensureLiveBalanceDefault();
+      // 실전에서 장시간 무시는 스테일 봉 기반 실주문으로 이어진다 — 강제 해제.
+      ignoreHours = false;
+    }
   }
   $: activeMaxBuyAmount = mode === 'live' ? maxBuyAmountLive : maxBuyAmount;
 
@@ -53,19 +63,29 @@
   let stopLossPct = saved.stopLossPct ?? 0;            // 매수가 대비 손절 % (예: 3 → -3%)
   let takeProfitPct = saved.takeProfitPct ?? 0;        // 매수가 대비 익절 % (예: 6 → +6%)
 
+  // 자동 매도(청산) 조건 — 각 트리거를 개별 on/off
+  let useStopLoss = saved.useStopLoss ?? true;         // 손절선 도달 시 청산
+  let useTakeProfit = saved.useTakeProfit ?? true;     // 익절선 도달 시 청산
+  let useTrailingStop = saved.useTrailingStop ?? true; // 고점 대비 되돌림 시 청산
+  let trailingStopAtr = saved.trailingStopAtr ?? 2.0;  // 트레일링 ATR 배수
+
   // 재진입 가드 (whipsaw 방지) + 피보나치 평균매수
   let lossCooldownBars = saved.lossCooldownBars ?? 3;       // 손절 청산 후 진입 금지 봉수
   let reentryCooldownBars = saved.reentryCooldownBars ?? 1; // 익절 청산 후 진입 금지 봉수
   let reentryGapPct = saved.reentryGapPct ?? 0;             // 손절가 × (1-이값) 이하에서만 재매수 (%)
+  let reentryGuardExpireBars = saved.reentryGuardExpireBars ?? 20; // 가격가드 자동 해제 봉수 (0=무기한)
   let fibEnabled = saved.fibEnabled ?? false;              // 피보나치 평균매수(물타기) 사용
   let fibMaxLevels = saved.fibMaxLevels ?? 3;              // 물타기 최대 차수
 
   // 진입 품질 게이트 + 청산 안정화 + OOS 선별
-  let requireConfirmation = saved.requireConfirmation ?? true;        // 확인봉(다음 봉 양봉/고점돌파)에서만 진입
+  let requireConfirmation = saved.requireConfirmation ?? true;        // 확인봉(양봉/고점돌파)에서만 진입
+  let confirmWindowBars = saved.confirmWindowBars ?? 3;               // 패턴 후 이 봉수 안의 확인도 인정
   let requireHigherTfUptrend = saved.requireHigherTfUptrend ?? true;  // 상위 TF 하락 시 롱 진입 금지
+  let higherTfTolerancePct = saved.higherTfTolerancePct ?? 0;         // 허용 하락 기울기 %/봉 (0=엄격)
   let minHoldBars = saved.minHoldBars ?? 1;                  // 익절/트레일링 최소 보유봉수
   let hardStopIntrabar = saved.hardStopIntrabar ?? false;    // 형성 중 봉 실시간가로 손절(off=닫힌 봉)
   let hardStopBufferPct = saved.hardStopBufferPct ?? 0;      // intrabar 손절 버퍼(%)
+  let eodFlatten = saved.eodFlatten ?? true;                 // 장 마감 전 강제 청산(오버나이트 갭 방지)
   let requireTradeable = saved.requireTradeable ?? true;     // OOS 검증 통과 종목만 매매
 
   function loadFromWatchlist() {
@@ -87,6 +107,7 @@
   let entryThreshold = saved.entryThreshold ?? 0.65;
   const hasSavedWeights = !!saved.weights;
   let error = '';
+  let info = ''; // 오류가 아닌 안내(예: OOS 제외 종목) — 에러 박스와 분리 표시
   let timer: ReturnType<typeof setInterval>;
 
   // 거래 내역 / 통계
@@ -119,11 +140,14 @@
   // 설정값이 바뀔 때마다 localStorage에 저장 → 다음 방문 시 기본값으로 유지된다.
   $: saveTradingSettings({
     mode, strategy, tf, watchlistText, pollSec, ignoreHours,
-    orderType, fixedQty, sellAll, maxBuyAmount, maxBuyAmountLive,
+    orderType, fixedQty, sellAll, maxPositions, maxBuyAmount, maxBuyAmountLive,
     stopLossPct, takeProfitPct,
-    lossCooldownBars, reentryCooldownBars, reentryGapPct, fibEnabled, fibMaxLevels,
-    requireConfirmation, requireHigherTfUptrend, minHoldBars, hardStopIntrabar, hardStopBufferPct,
-    requireTradeable, weights, entryThreshold,
+    useStopLoss, useTakeProfit, useTrailingStop, trailingStopAtr,
+    lossCooldownBars, reentryCooldownBars, reentryGapPct, reentryGuardExpireBars,
+    fibEnabled, fibMaxLevels,
+    requireConfirmation, confirmWindowBars, requireHigherTfUptrend, higherTfTolerancePct,
+    minHoldBars, hardStopIntrabar, hardStopBufferPct,
+    eodFlatten, requireTradeable, weights, entryThreshold,
   });
 
   async function refreshStatus() {
@@ -261,8 +285,9 @@
     .map((p) => p.code as string)
     .filter((c) => !((status.watchlist ?? []) as string[]).includes(c));
 
-  async function start() {
+  async function start(confirmDiscard = false) {
     error = '';
+    info = '';
     if (mode === 'live' && !report?.ready) {
       const ok = confirm('검증 기준 미달 상태입니다. 그래도 실전투자를 시작하시겠습니까?\n(권장: 모의투자로 충분히 검증 후 진행)');
       if (!ok) return;
@@ -282,6 +307,7 @@
         mode, strategy: { name: strategy, weights, entry_threshold: entryThreshold },
         symbol_strategies: symMap,
         watchlist: wl, tf, poll_sec: pollSec, ignore_market_hours: ignoreHours,
+        confirm_discard: confirmDiscard,
         order: {
           order_type: orderType,
           fixed_qty: fixedQty,
@@ -292,25 +318,46 @@
         risk: {
           stop_loss_pct: stopLossPct / 100,
           take_profit_pct: takeProfitPct / 100,
+          use_stop_loss: useStopLoss,
+          use_take_profit: useTakeProfit,
+          use_trailing_stop: useTrailingStop,
+          trailing_stop_atr: trailingStopAtr,
           loss_cooldown_bars: lossCooldownBars,
           reentry_cooldown_bars: reentryCooldownBars,
           reentry_gap_pct: reentryGapPct / 100,
+          reentry_guard_expire_bars: reentryGuardExpireBars,
+          max_positions: maxPositions,
           fib_averaging_enabled: fibEnabled,
           fib_max_levels: fibMaxLevels,
           require_confirmation: requireConfirmation,
+          confirm_window_bars: confirmWindowBars,
           require_higher_tf_uptrend: requireHigherTfUptrend,
+          higher_tf_slope_tolerance: higherTfTolerancePct / 100,
           min_hold_bars: minHoldBars,
           hard_stop_intrabar: hardStopIntrabar,
           hard_stop_buffer_pct: hardStopBufferPct / 100,
+          eod_flatten: eodFlatten,
         },
       });
+      const notes: string[] = [];
       if (resStart?.dropped_untradeable?.length) {
-        error = `OOS 미통과로 제외된 종목: ${resStart.dropped_untradeable.join(', ')}`;
+        notes.push(`OOS 미통과로 제외된 종목: ${resStart.dropped_untradeable.join(', ')}`);
       }
+      if (resStart?.restored_from_snapshot) {
+        notes.push('이전 세션의 보유 포지션/현금을 스냅샷에서 복원했습니다.');
+      }
+      info = notes.join(' · ');
       await refreshStatus();
       await refreshReadiness();
     } catch (e) {
-      error = String(e);
+      const msg = String(e);
+      // 이전 엔진(모드 전환 등)에 보유 포지션이 있으면 백엔드가 확인을 요구한다.
+      const m = msg.match(/DISCARD_CONFIRM:(.*)$/s);
+      if (m && !confirmDiscard) {
+        if (confirm(`${m[1].trim()}\n\n계속 진행할까요?`)) await start(true);
+        return;
+      }
+      error = msg;
     }
   }
   async function stop() {
@@ -362,12 +409,15 @@
   function phaseClass(phase: string): string {
     if (phase === '진입') return 'ph-enter';
     if (phase === '보유중') return 'ph-hold';
-    if (phase === '쿨다운' || phase === '재매수가드') return 'ph-cool';
+    if (phase === '쿨다운' || phase === '재매수가드' || phase === '마감임박' || phase === '마감청산') return 'ph-cool';
     if (phase === '확인봉대기' || phase === '게이트미달' || phase === '상위TF역행' || phase === '숏차단') return 'ph-gate';
     if (phase === '진입제한' || phase === '주문실패' || phase === '수량부족') return 'ph-block';
     return 'ph-idle';
   }
   $: monitorRows = (status.monitor ?? []) as any[];
+  // 퍼널 진단: 종목들이 지금 어느 단계(phase)에 몇 개씩 걸려 있는지 집계 — 많은 순 정렬.
+  $: phaseSummary = Object.entries((status.monitor_summary ?? {}) as Record<string, number>)
+    .sort((a, b) => b[1] - a[1]);
   const asPct = (v: number) => (v * 100).toFixed(v * 100 % 1 === 0 ? 0 : 1) + '%';
   // 실행 중인 엔진 설정 — status가 우선, 없으면 폼의 현재 입력값으로 폴백
   $: cfgRisk = status.risk ?? null;
@@ -406,6 +456,7 @@
 </p>
 
 {#if error}<div class="error">{error}</div>{/if}
+{#if info}<div class="info">ℹ️ {info}</div>{/if}
 
 <div class="grid">
   <section class="card">
@@ -441,12 +492,20 @@
       </p>
     {/if}
     <div class="row"><label>폴링(초)</label><input type="number" bind:value={pollSec} min="2" /></div>
-    <div class="row"><label>장시간 무시</label><input type="checkbox" bind:checked={ignoreHours} /></div>
+    <div class="row">
+      <label title="장외/주말에도 엔진을 돌립니다 (테스트용). 실전 모드에서는 스테일 봉 기반 실주문을 막기 위해 사용할 수 없습니다.">장시간 무시</label>
+      <input type="checkbox" bind:checked={ignoreHours} disabled={mode === 'live'} />
+      {#if mode === 'live'}<span class="unit">실전에서는 사용 불가</span>{/if}
+    </div>
     <div class="actions">
       {#if status.running}
         <button class="stop" on:click={stop}>■ 정지</button>
+        <button class="reapply" on:click={() => start()}
+          title="정지 없이 현재 폼의 관심종목/전략/리스크 설정을 실행 중인 엔진에 적용합니다 (포지션·현금 유지)">
+          ⟳ 설정 재적용
+        </button>
       {:else}
-        <button class="start" on:click={start}>▶ 시작</button>
+        <button class="start" on:click={() => start()}>▶ 시작</button>
       {/if}
       {#if liveAdvisory}<span class="gate-note">⚠️ 검증 미달(참고) — 시작은 가능하나 모의투자 검증을 권장합니다</span>{/if}
     </div>
@@ -488,11 +547,16 @@
       <label>매도 방식</label>
       <label class="chk"><input type="checkbox" bind:checked={sellAll} /> 전량매도</label>
     </div>
+    <div class="row">
+      <label title="동시에 보유할 수 있는 최대 종목 수 — 이 수에 도달하면 신규 진입이 '진입제한'으로 차단됩니다">최대 보유종목</label>
+      <input type="number" bind:value={maxPositions} min="1" max="50" />
+      <span class="unit">종목</span>
+    </div>
     <p class="hint">
       1회 수량 0이면 리스크 기준(자본 1%·ATR)으로 자동 산정합니다.
       매수 한도액은 <b>1회 주문이 아니라 보유 포지션 전체의 진입금액 합계</b>에 대한 한도이며,
       새 진입은 (한도액 − 현재 총 진입금액)과 가용현금 중 작은 값으로 제한됩니다.
-      {#if mode === 'live'}실전투자는 기본값으로 현재 계좌 잔고({activeMaxBuyAmount.toLocaleString()}원)를 사용합니다.{/if}
+      {#if mode === 'live'}실전투자는 기본값으로 계좌 잔고의 50%(현재 {activeMaxBuyAmount.toLocaleString()}원)를 사용합니다 — 필요 시 직접 조정하세요.{/if}
       {#if !sellAll && fixedQty > 0}<br>※ 전량매도 해제 + 1회수량 설정 시, 청산 신호에 {fixedQty}주씩 부분 매도합니다.{/if}
     </p>
   </section>
@@ -516,6 +580,35 @@
   </section>
 
   <section class="card">
+    <h3>자동 매도(청산) 조건</h3>
+    <p class="hint">보유 포지션을 자동으로 청산할 트리거를 개별 선택합니다. 각 조건은 <b>닫힌 봉</b>에서 판단하며(실시간 손절은 아래 '진입 품질' 카드에서 별도 설정), 위 손절·익절선을 그대로 사용합니다.</p>
+    <div class="row">
+      <label title="손절선(매수가 −손절%, 또는 ATR 기준)에 도달하면 청산">손절 청산</label>
+      <label class="chk"><input type="checkbox" bind:checked={useStopLoss} /> 손절선 도달 시 자동 매도</label>
+    </div>
+    <div class="row">
+      <label title="익절선(매수가 +익절%, 또는 ATR 기준)에 도달하면 청산">익절 청산</label>
+      <label class="chk"><input type="checkbox" bind:checked={useTakeProfit} /> 익절선 도달 시 자동 매도</label>
+    </div>
+    <div class="row">
+      <label title="수익 구간에서 고점 대비 ATR×배수만큼 되돌리면 청산(이익 보호)">트레일링 스탑</label>
+      <label class="chk"><input type="checkbox" bind:checked={useTrailingStop} /> 고점 되돌림 시 자동 매도</label>
+    </div>
+    <div class="row">
+      <label title="트레일링 스탑 폭 = ATR × 이 배수. 작을수록 민감(빨리 청산), 클수록 느슨">트레일링 폭</label>
+      <input type="number" bind:value={trailingStopAtr} min="0.5" step="0.1" disabled={!useTrailingStop} />
+      <span class="unit">× ATR (고점 −ATR×{trailingStopAtr} 하락 시 청산)</span>
+    </div>
+    <div class="row">
+      <label title="15:05부터 신규 진입 중단, 15:10부터 보유 전량 강제 청산 — 오버나이트 갭 리스크를 없앱니다 (장시간 무시 시에는 동작하지 않음)">거래종료 임박 청산</label>
+      <label class="chk"><input type="checkbox" bind:checked={eodFlatten} /> 장 마감 전 전량 청산 (15:05 진입중단 · 15:10 청산)</label>
+    </div>
+    {#if !useStopLoss}
+      <p class="hint warn-hint">⚠️ 손절 청산을 끄면 가격 기반 손절이 완전히 비활성화됩니다(실시간 손절 포함). {eodFlatten ? '거래종료 임박 청산·' : ''}일일 손실 한도만 남습니다 — 위험을 감안하세요.</p>
+    {/if}
+  </section>
+
+  <section class="card">
     <h3>재진입 가드 (whipsaw 방지)</h3>
     <p class="hint">저가 매도 후 즉시 고가 재매수를 막습니다. 진입·일반청산은 <b>닫힌 봉</b>에서만 판단하고(하드손절만 실시간), 청산 후 일정 봉수 동안 재진입을 막습니다.</p>
     <div class="row">
@@ -530,6 +623,10 @@
       <label>재매수 가격가드</label>
       <input type="number" bind:value={reentryGapPct} min="0" step="0.1" /> <span class="unit">% (손절가보다 이만큼 낮을 때만 재매수)</span>
     </div>
+    <div class="row">
+      <label title="손절 후 이 봉수가 지나면 가격가드를 자동 해제합니다 — 회복·상승 전환된 종목의 재진입이 영구히 막히지 않도록">가드 자동해제</label>
+      <input type="number" bind:value={reentryGuardExpireBars} min="0" /> <span class="unit">봉 (0 = 무기한 유지)</span>
+    </div>
   </section>
 
   <section class="card">
@@ -541,15 +638,25 @@
     </div>
     <div class="row">
       <label>확인봉</label>
-      <label class="chk"><input type="checkbox" bind:checked={requireConfirmation} /> 다음 봉 확인(양봉/고점돌파) 시에만 진입</label>
+      <label class="chk"><input type="checkbox" bind:checked={requireConfirmation} /> 확인봉(양봉/고점돌파) 시에만 진입</label>
+    </div>
+    <div class="row">
+      <label title="패턴 발생 후 이 봉수 안에 확인봉이 나오면 진입 — 1이면 예전처럼 '바로 다음 봉'만 인정">확인 유효기간</label>
+      <input type="number" bind:value={confirmWindowBars} min="1" max="10" disabled={!requireConfirmation} />
+      <span class="unit">봉 (패턴 후 이 안에 확인되면 진입)</span>
     </div>
     <div class="row">
       <label>상위TF 추세</label>
       <label class="chk"><input type="checkbox" bind:checked={requireHigherTfUptrend} /> 상위 TF 하락이면 진입 금지</label>
     </div>
     <div class="row">
+      <label title="0이면 상위 TF 기울기가 조금만 음수여도 차단(엄격). 값을 주면 봉당 이 %까지의 완만한 하락은 허용하고 뚜렷한 하락만 차단합니다">허용 기울기</label>
+      <input type="number" bind:value={higherTfTolerancePct} min="0" step="0.01" disabled={!requireHigherTfUptrend} />
+      <span class="unit">%/봉 (이 이하의 완만한 하락은 허용, 0=엄격)</span>
+    </div>
+    <div class="row">
       <label>최소 보유</label>
-      <input type="number" bind:value={minHoldBars} min="0" /> <span class="unit">봉 (이 전엔 익절/트레일링 보류)</span>
+      <input type="number" bind:value={minHoldBars} min="0" /> <span class="unit">봉 (이 전엔 트레일링만 보류 — 손절·익절은 즉시)</span>
     </div>
     <div class="row">
       <label>실시간 손절</label>
@@ -610,6 +717,13 @@
       <div class={status.daily_pnl >= 0 ? 'pos' : 'neg'}>일손익: {fmtPnl(status.daily_pnl ?? 0)}</div>
       {#if positions.length && liveAt}<div class="liveat">⟳ 현재가 {liveAt}</div>{/if}
     </div>
+    {#if (status.unmanaged_holdings ?? []).length > 0}
+      <p class="unmanaged">
+        ⚠️ 계좌에 엔진이 관리하지 않는 보유 종목이 있습니다:
+        <b>{status.unmanaged_holdings.join(', ')}</b>
+        — 자동 손절/익절이 적용되지 않으니 직접 관리하거나 수동 매도하세요.
+      </p>
+    {/if}
     {#if cfgOrder}
       <div class="cfg-summary">
         <div class="cfg-group">
@@ -661,9 +775,13 @@
               <div><dt>종목당 비중상한</dt><dd>{asPct(cfgRisk.max_position_pct)}</dd></div>
               <div><dt>최대 보유종목</dt><dd>{cfgRisk.max_positions}개</dd></div>
               <div><dt>일손실 한도</dt><dd>{asPct(cfgRisk.daily_loss_limit_pct)}</dd></div>
-              <div><dt>손절선</dt><dd>{cfgRisk.stop_loss_pct > 0 ? '−' + asPct(cfgRisk.stop_loss_pct) + ' 고정' : 'ATR ×' + cfgRisk.stop_loss_atr_mult}</dd></div>
-              <div><dt>익절선</dt><dd>{cfgRisk.take_profit_pct > 0 ? '+' + asPct(cfgRisk.take_profit_pct) + ' 고정' : 'ATR ×' + cfgRisk.take_profit_atr_mult}</dd></div>
-              <div><dt>트레일링 ATR</dt><dd>×{cfgRisk.trailing_stop_atr}</dd></div>
+              <div><dt>손절 청산</dt><dd class={cfgRisk.use_stop_loss === false ? 'muted' : 'pos'}>
+                {cfgRisk.use_stop_loss === false ? 'OFF' : (cfgRisk.stop_loss_pct > 0 ? '−' + asPct(cfgRisk.stop_loss_pct) + ' 고정' : 'ATR ×' + cfgRisk.stop_loss_atr_mult)}</dd></div>
+              <div><dt>익절 청산</dt><dd class={cfgRisk.use_take_profit === false ? 'muted' : 'pos'}>
+                {cfgRisk.use_take_profit === false ? 'OFF' : (cfgRisk.take_profit_pct > 0 ? '+' + asPct(cfgRisk.take_profit_pct) + ' 고정' : 'ATR ×' + cfgRisk.take_profit_atr_mult)}</dd></div>
+              <div><dt>트레일링 청산</dt><dd class={cfgRisk.use_trailing_stop === false ? 'muted' : 'pos'}>
+                {cfgRisk.use_trailing_stop === false ? 'OFF' : 'ATR ×' + cfgRisk.trailing_stop_atr}</dd></div>
+              <div><dt>거래종료 임박 청산</dt><dd class={cfgRisk.eod_flatten ? 'pos' : 'muted'}>{onoff(cfgRisk.eod_flatten)}</dd></div>
             </dl>
           </div>
 
@@ -673,15 +791,16 @@
               <div><dt>손절 후 쿨다운</dt><dd>{cfgRisk.loss_cooldown_bars}봉</dd></div>
               <div><dt>익절 후 쿨다운</dt><dd>{cfgRisk.reentry_cooldown_bars}봉</dd></div>
               <div><dt>재매수 가격가드</dt><dd>{asPct(cfgRisk.reentry_gap_pct)}</dd></div>
+              <div><dt>가드 자동해제</dt><dd>{cfgRisk.reentry_guard_expire_bars > 0 ? cfgRisk.reentry_guard_expire_bars + '봉' : '무기한'}</dd></div>
             </dl>
           </div>
 
           <div class="cfg-group">
             <h5>진입 품질 · 청산 안정화</h5>
             <dl>
-              <div><dt>확인봉</dt><dd>{onoff(cfgRisk.require_confirmation)}</dd></div>
-              <div><dt>상위TF 추세</dt><dd>{onoff(cfgRisk.require_higher_tf_uptrend)}</dd></div>
-              <div><dt>최소 보유</dt><dd>{cfgRisk.min_hold_bars}봉</dd></div>
+              <div><dt>확인봉</dt><dd>{onoff(cfgRisk.require_confirmation)}{#if cfgRisk.require_confirmation} · {cfgRisk.confirm_window_bars ?? 1}봉 내{/if}</dd></div>
+              <div><dt>상위TF 추세</dt><dd>{onoff(cfgRisk.require_higher_tf_uptrend)}{#if cfgRisk.require_higher_tf_uptrend && (cfgRisk.higher_tf_slope_tolerance ?? 0) > 0} · 허용 {(cfgRisk.higher_tf_slope_tolerance * 100).toFixed(2)}%/봉{/if}</dd></div>
+              <div><dt>최소 보유</dt><dd>{cfgRisk.min_hold_bars}봉 (트레일링만)</dd></div>
               <div><dt>실시간 손절</dt><dd>{onoff(cfgRisk.hard_stop_intrabar)}</dd></div>
               <div><dt>손절 버퍼</dt><dd>{asPct(cfgRisk.hard_stop_buffer_pct)}</dd></div>
             </dl>
@@ -709,6 +828,13 @@
     {/if}
 
     <h4>모니터링 현황 ({monitorRows.length}) <span class="sub-note">— 각 종목에 적용 중인 전략(적용전략)과 매 사이클 판정 결과 (마지막 판정 기준)</span></h4>
+    {#if phaseSummary.length > 0}
+      <div class="funnel" title="종목들이 지금 어느 판정 단계에 몇 개씩 있는지 — 진입이 적다면 가장 큰 배지의 게이트를 완화하세요">
+        {#each phaseSummary as [ph, n]}
+          <span class="phase {phaseClass(ph)}">{ph} {n}</span>
+        {/each}
+      </div>
+    {/if}
     <table>
       <thead>
         <tr>
@@ -931,6 +1057,9 @@
   .actions { margin-top: 14px; }
   .start { background: #a6e3a1; color: #1e1e2e; }
   .stop { background: #f38ba8; color: #1e1e2e; }
+  .reapply { background: #89b4fa; color: #1e1e2e; margin-left: 8px; }
+  .funnel { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 10px; }
+  .funnel .phase { font-size: 12px; }
   .start, .stop, .hot { border: none; border-radius: 6px; padding: 9px 20px; font-weight: 700; cursor: pointer; }
   .gate-note { margin-left: 12px; font-size: 12px; color: #f9e2af; }
   .mini { background: #313244; color: #cdd6f4; border: none; border-radius: 4px; padding: 6px 10px; cursor: pointer; font-size: 12px; white-space: nowrap; }
@@ -946,6 +1075,7 @@
   .wrow input[type="range"] { flex: 1; }
   .wrow span { width: 36px; text-align: right; font-size: 12px; }
   .hint { font-size: 11px; color: #6c7086; margin-top: 10px; }
+  .warn-hint { color: #f9e2af; }
   .unit { font-size: 12px; color: #9399b2; white-space: nowrap; }
   .chk { display: flex; align-items: center; gap: 6px; width: auto; color: #cdd6f4; font-size: 13px; }
   .chk input { width: auto; }
@@ -954,7 +1084,10 @@
     margin-top: 12px; padding-top: 12px; border-top: 1px solid #313244;
     display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px;
   }
-  .cfg-group { background: #1e1e2e; border-radius: 8px; padding: 10px 12px; }
+  .cfg-group {
+    background: #1e1e2e; border-radius: 8px; padding: 10px 12px;
+    height: 500px; overflow-y: auto;
+  }
   .cfg-group h5 { margin: 0 0 8px; font-size: 12px; color: #89b4fa; font-weight: 600; }
   .cfg-group dl { margin: 0; display: flex; flex-direction: column; gap: 4px; }
   .cfg-group dl > div { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; }
@@ -1031,6 +1164,8 @@
   .clear-btn:hover { background: #45475a; }
   .empty { color: #6c7086; text-align: center; }
   .error, .err { background: #f38ba8; color: #1e1e2e; padding: 8px; border-radius: 6px; font-size: 12px; margin-top: 8px; }
+  .info { background: #313244; color: #89b4fa; border: 1px solid #45475a; padding: 8px 12px; border-radius: 6px; font-size: 12px; margin-top: 8px; }
+  .unmanaged { background: #45475a; color: #f9e2af; padding: 8px 12px; border-radius: 6px; font-size: 12px; margin: 8px 0 0; }
   .buy-tag { color: #ef4444; font-weight: 700; }
   .sell-tag { color: #3b82f6; font-weight: 700; }
   /* 청산(close) 이벤트는 진입(open)과 다른 색 계열(초록/분홍)로 — 매수/매도의

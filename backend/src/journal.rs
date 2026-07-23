@@ -37,23 +37,28 @@ pub struct TradeJournal {
 }
 
 impl TradeJournal {
-    /// Open (or create) the journal at `backend/data/trade_journal.json`.
-    /// A legacy JSON-array file is migrated to JSONL in place on first open.
+    /// Open (or create) the journal at `backend/data/trade_journal.jsonl`.
+    /// Legacy files (`trade_journal.json` as JSON array or JSONL) are migrated
+    /// to the new name/format on first open.
     pub fn new() -> Self {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/trade_journal.json");
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("trade_journal.jsonl");
+        let legacy = dir.join("trade_journal.json");
+        if !path.exists() && legacy.exists() {
+            let content = std::fs::read_to_string(&legacy).unwrap_or_default();
+            let jsonl = if content.trim_start().starts_with('[') {
+                let arr = serde_json::from_str::<Vec<Value>>(&content).unwrap_or_default();
+                tracing::info!("[journal] migrated legacy JSON array → JSONL ({} records)", arr.len());
+                arr.iter().filter_map(|v| serde_json::to_string(v).ok()).map(|l| l + "\n").collect()
+            } else {
+                content // already JSONL, just misnamed .json
+            };
+            let _ = std::fs::write(&path, jsonl);
+            let _ = std::fs::rename(&legacy, dir.join("trade_journal.json.bak"));
         }
         if !path.exists() {
             let _ = std::fs::write(&path, "");
-        }
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        if content.trim_start().starts_with('[') {
-            if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&content) {
-                let jsonl: String = arr.iter().filter_map(|v| serde_json::to_string(v).ok()).map(|l| l + "\n").collect();
-                let _ = std::fs::write(&path, jsonl);
-                tracing::info!("[journal] migrated legacy JSON array → JSONL ({} records)", arr.len());
-            }
         }
         Self { path, lock: Mutex::new(()) }
     }

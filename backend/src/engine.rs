@@ -21,8 +21,10 @@ use crate::timeframe::Timeframe;
 use crate::universe::name_for;
 use chrono::{Datelike, NaiveDate, Timelike, Utc, Weekday};
 use chrono_tz::Asia::Seoul;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -126,11 +128,58 @@ struct State {
     opened_meta: HashMap<String, (String, String)>, // code -> (opened_at, pattern)
     last_bar_ts: HashMap<String, i64>,
     cooldown: HashMap<String, i64>,
-    last_exit_price: HashMap<String, f64>,
+    /// Stop-out re-buy guard: code → (exit fill price, bars until the guard
+    /// expires; 0 = never expires). Decremented once per closed bar.
+    last_exit_price: HashMap<String, (f64, i64)>,
     bars_held: HashMap<String, i64>,
     current_prices: HashMap<String, f64>,
+    /// Codes with a close order in flight — blocks a second concurrent close
+    /// (manual vs automatic) from double-selling the same position.
+    closing: HashSet<String>,
+    /// Live only: account holdings (t0424) the engine does not track — surfaced
+    /// in status so orphaned/manual holdings are visible instead of silent.
+    unmanaged_holdings: Vec<String>,
     trade_events: Vec<Value>,
     monitor: HashMap<String, Value>, // code -> latest per-cycle monitoring snapshot
+}
+
+/// On-disk engine snapshot (per mode) so a backend restart doesn't orphan open
+/// positions — without this, live holdings would lose all stop/target
+/// management the moment the process dies.
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    /// KST date (YYYY-MM-DD) the snapshot was written; daily P&L is only
+    /// restored for a same-day restart.
+    day: String,
+    cash: f64,
+    seed_cash: f64,
+    daily_pnl: f64,
+    day_start_equity: f64,
+    positions: HashMap<String, crate::risk::Position>,
+    opened_meta: HashMap<String, (String, String)>,
+    cooldown: HashMap<String, i64>,
+    last_exit_price: HashMap<String, (f64, i64)>,
+    bars_held: HashMap<String, i64>,
+}
+
+fn snapshot_path(mode: TradingMode) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("data/engine_state_{}.json", mode.as_str()))
+}
+
+fn kst_today() -> String {
+    Utc::now().with_timezone(&Seoul).format("%Y-%m-%d").to_string()
+}
+
+/// Upper bound on how many missed bars one cycle will compensate for — bounds
+/// both the pattern-scan window and the cooldown/guard catch-up per cycle.
+const MISSED_BARS_CAP: i64 = 10;
+
+/// A timeframe's bar length in seconds (daily counts as one calendar day).
+fn tf_secs(tf: Timeframe) -> i64 {
+    match tf {
+        Timeframe::D1 => 86_400,
+        _ => tf.config().ncnt as i64 * 60,
+    }
 }
 
 impl State {
@@ -187,6 +236,35 @@ impl State {
         self.current_prices.retain(|c, _| keep.contains(c));
         self.monitor.retain(|c, _| keep.contains(c));
         self.symbol_strategies.retain(|c, _| keep.contains(c));
+    }
+
+    /// Write the current positions/cash/state to disk (crash/restart recovery).
+    /// Called after every trade mutation and at each cycle end — cheap (small JSON).
+    fn persist(&self, mode: TradingMode) {
+        let snap = Snapshot {
+            day: kst_today(),
+            cash: self.cash,
+            seed_cash: self.seed_cash,
+            daily_pnl: self.risk.daily_pnl(),
+            day_start_equity: self.risk.day_start_equity(),
+            positions: self.risk.open_positions().clone(),
+            opened_meta: self.opened_meta.clone(),
+            cooldown: self.cooldown.clone(),
+            last_exit_price: self.last_exit_price.clone(),
+            bars_held: self.bars_held.clone(),
+        };
+        let path = snapshot_path(mode);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match serde_json::to_string(&snap) {
+            Ok(s) => {
+                if let Err(e) = std::fs::write(&path, s) {
+                    tracing::warn!("engine snapshot write failed: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("engine snapshot serialize failed: {e}"),
+        }
     }
 
     /// Store this cycle's monitoring snapshot for one symbol (overwrites the previous).
@@ -254,6 +332,8 @@ impl TradingEngine {
             last_exit_price: HashMap::new(),
             bars_held: HashMap::new(),
             current_prices: HashMap::new(),
+            closing: HashSet::new(),
+            unmanaged_holdings: vec![],
             trade_events: vec![],
             monitor: HashMap::new(),
         }));
@@ -262,6 +342,42 @@ impl TradingEngine {
 
     pub fn mode(&self) -> TradingMode {
         self.mode
+    }
+
+    /// Restore a saved snapshot for this mode, if one exists. Returns true when
+    /// state was restored — the caller then starts with `resume=true` so the
+    /// restored cash isn't re-seeded. Daily P&L only survives a same-day restart.
+    pub async fn restore_snapshot(&self) -> bool {
+        let Ok(raw) = std::fs::read_to_string(snapshot_path(self.mode)) else {
+            return false;
+        };
+        let Ok(snap) = serde_json::from_str::<Snapshot>(&raw) else {
+            tracing::warn!("engine snapshot unreadable — starting fresh");
+            return false;
+        };
+        let mut s = self.state.lock().await;
+        s.cash = snap.cash;
+        s.seed_cash = snap.seed_cash;
+        s.opened_meta = snap.opened_meta;
+        s.cooldown = snap.cooldown;
+        s.last_exit_price = snap.last_exit_price;
+        s.bars_held = snap.bars_held;
+        let n = snap.positions.len();
+        s.risk.restore_positions(snap.positions);
+        if snap.day == kst_today() {
+            s.risk.set_daily_pnl(snap.daily_pnl);
+            s.risk.set_day_start_equity(snap.day_start_equity);
+        } else {
+            let eq = s.equity();
+            s.risk.reset_daily(eq);
+        }
+        tracing::info!("[engine] snapshot restored ({} mode, {n} positions, cash={:.0})", self.mode.as_str(), s.cash);
+        true
+    }
+
+    /// Delete the on-disk snapshot for a mode (used by an explicit reset).
+    pub fn clear_snapshot(mode: TradingMode) {
+        let _ = std::fs::remove_file(snapshot_path(mode));
     }
 
     pub async fn running(&self) -> bool {
@@ -351,6 +467,9 @@ impl TradingEngine {
         let (mut price, mut candle_ts);
         {
             let s = self.state.lock().await;
+            if s.closing.contains(code) {
+                return json!({"ok": false, "reason": "close_in_progress"});
+            }
             if s.risk.position(code).is_none() {
                 return json!({"ok": false, "reason": "no_position"});
             }
@@ -364,21 +483,30 @@ impl TradingEngine {
             price = last.close;
             candle_ts = candle_unix_ts(last);
         }
-        let s = self.state.lock().await;
+        let mut s = self.state.lock().await;
+        // Re-check + arm the in-flight guard under one lock: the automatic exit
+        // path also sells outside the lock, and both closing the same position
+        // would double-sell it (a real order the live account can't cover).
+        if s.closing.contains(code) {
+            return json!({"ok": false, "reason": "close_in_progress"});
+        }
         let Some(pos) = s.risk.position(code).cloned() else {
             return json!({"ok": false, "reason": "no_position"});
         };
         let (qty, entry, side) = (pos.qty, pos.entry, pos.side);
         let order_type = s.order.order_type.clone();
+        s.closing.insert(code.to_string());
         drop(s);
         let fill = match side {
             Side::Long => self.deps.broker.sell(&token, code, qty, price, &order_type).await,
             Side::Short => self.deps.broker.cover(&token, code, qty, price, &order_type).await,
         };
         if !fill.ok {
+            self.state.lock().await.closing.remove(code);
             return json!({"ok": false, "reason": "order_failed"});
         }
         let mut s = self.state.lock().await;
+        s.closing.remove(code);
         let dir = if side == Side::Short { -1.0 } else { 1.0 };
         let pnl = (fill.fill_price - entry) * qty as f64 * dir;
         match side {
@@ -395,6 +523,7 @@ impl TradingEngine {
             "qty": qty, "pnl": pnl.round(), "pnl_pct": (pnl_pct * 100.0).round() / 100.0,
             "reason": "manual_close", "ts": candle_ts, "time_label": hhmm_label(),
         }));
+        s.persist(self.deps.broker.mode);
         tracing::info!("MANUAL CLOSE {code} x{qty} @{:.0} pnl={:.0}", fill.fill_price, pnl);
         json!({"ok": true, "fill_price": fill.fill_price, "qty": qty,
                "pnl": pnl.round(), "pnl_pct": (pnl_pct * 100.0).round() / 100.0})
@@ -433,6 +562,12 @@ impl TradingEngine {
             .collect();
         let mut monitor: Vec<Value> = s.monitor.values().cloned().collect();
         monitor.sort_by(|a, b| a["code"].as_str().unwrap_or("").cmp(b["code"].as_str().unwrap_or("")));
+        // Funnel diagnostics: how many symbols sit in each phase right now —
+        // shows at a glance which gate is filtering the watchlist.
+        let mut monitor_summary: HashMap<String, usize> = HashMap::new();
+        for m in s.monitor.values() {
+            *monitor_summary.entry(m["phase"].as_str().unwrap_or("-").to_string()).or_insert(0) += 1;
+        }
         // Per-symbol strategy assignments (code → {strategy, tf}) for the UI.
         let symbol_strategies: serde_json::Map<String, Value> = s
             .symbol_strategies
@@ -459,11 +594,21 @@ impl TradingEngine {
             "positions": positions,
             "trade_events": recent,
             "monitor": monitor,
+            "monitor_summary": monitor_summary,
             "order": s.order.to_json(),
             "risk": s.risk.cfg.to_json(),
+            "unmanaged_holdings": s.unmanaged_holdings,
             "last_error": s.last_error,
         })
     }
+}
+
+/// True current price via t1101 — bypasses the candle cache (which can be up
+/// to its TTL stale) for the intrabar hard stop.
+async fn fresh_price(deps: &Deps, token: &str, code: &str) -> Option<f64> {
+    let ebest = deps.ebest.as_ref()?;
+    let q = ebest.stock_price(token, code).await;
+    q.get("price").and_then(crate::ebest::parse_float).filter(|p| *p > 0.0)
 }
 
 /// Resolve an eBest auth token (empty when no client is configured).
@@ -507,8 +652,9 @@ async fn run_loop(deps: Arc<Deps>, state: Arc<Mutex<State>>, poll_sec: u64, resu
     if !resume {
         let token = resolve_token(&deps).await;
         let mut s = state.lock().await;
-        s.risk.reset_daily();
         s.cash = seed_equity(&deps, &token, s.seed_cash).await;
+        let eq = s.equity();
+        s.risk.reset_daily(eq);
     }
     let mut last_day = Utc::now().with_timezone(&Seoul).date_naive();
     loop {
@@ -522,7 +668,9 @@ async fn run_loop(deps: Arc<Deps>, state: Arc<Mutex<State>>, poll_sec: u64, resu
         let today = Utc::now().with_timezone(&Seoul).date_naive();
         if today != last_day {
             last_day = today;
-            state.lock().await.risk.reset_daily();
+            let mut s = state.lock().await;
+            let eq = s.equity();
+            s.risk.reset_daily(eq);
         }
         let is_open = {
             let g = state.lock().await;
@@ -545,6 +693,17 @@ async fn run_loop(deps: Arc<Deps>, state: Arc<Mutex<State>>, poll_sec: u64, resu
                     tracing::error!("trade loop error: {e}");
                 }
             }
+            // Live: reconcile internal positions with the real account so fill
+            // slippage / external sells / orphaned holdings can't silently
+            // desync the engine from reality.
+            if deps.broker.mode == TradingMode::Live {
+                reconcile_live(&deps, &state, &token).await;
+            }
+            // Persist after each cycle so a crash/restart can restore positions.
+            {
+                let s = state.lock().await;
+                s.persist(deps.broker.mode);
+            }
         }
         // Sleep in 1s slices so a stop request takes effect promptly instead of
         // lingering for up to a full poll interval.
@@ -552,11 +711,20 @@ async fn run_loop(deps: Arc<Deps>, state: Arc<Mutex<State>>, poll_sec: u64, resu
         while slept < poll_sec.max(1) {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             slept += 1;
-            if !state.lock().await.running {
+            let stopped = {
+                let s = state.lock().await;
+                if !s.running {
+                    s.persist(deps.broker.mode);
+                }
+                !s.running
+            };
+            if stopped {
                 return;
             }
         }
     }
+    let s = state.lock().await;
+    s.persist(deps.broker.mode);
 }
 
 /// Seed cash: paper uses the virtual seed; live reads the account deposit.
@@ -573,13 +741,106 @@ async fn seed_equity(deps: &Deps, token: &str, seed_cash: f64) -> f64 {
     seed_cash
 }
 
+/// Live-mode account reconciliation (t0424): adopt the account's actual
+/// qty/average price (fill slippage correction), forget positions that no
+/// longer exist in the account, and surface holdings the engine doesn't track.
+/// Internal cash is intentionally *not* overwritten — t0424's 예수금 moves on
+/// D+2 settlement and would whipsaw the sizing math.
+async fn reconcile_live(deps: &Deps, state: &Arc<Mutex<State>>, token: &str) {
+    let Some(ebest) = &deps.ebest else { return };
+    let bal = ebest.get_account_balance(token).await;
+    let Some(rows) = bal.get("t0424OutBlock1").and_then(Value::as_array) else {
+        return; // account query failed — keep internal state, try next cycle
+    };
+    let mut acct: HashMap<String, (f64, i64)> = HashMap::new();
+    for r in rows {
+        let code = r
+            .get("expcode")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .trim_start_matches('A')
+            .to_string();
+        let qty = r.get("janqty").and_then(crate::ebest::parse_float).unwrap_or(0.0) as i64;
+        let avg = r.get("pamt").and_then(crate::ebest::parse_float).unwrap_or(0.0);
+        if !code.is_empty() && qty > 0 {
+            acct.insert(code, (avg, qty));
+        }
+    }
+    let mut s = state.lock().await;
+    let tracked: Vec<(String, crate::risk::Position)> = s
+        .risk
+        .open_positions()
+        .iter()
+        .map(|(c, p)| (c.clone(), p.clone()))
+        .collect();
+    for (code, pos) in &tracked {
+        if pos.side == Side::Short || s.closing.contains(code) {
+            continue; // shorts never live; in-flight closes settle next cycle
+        }
+        match acct.get(code) {
+            Some((avg, qty)) => {
+                let price_drift = *avg > 0.0 && (pos.entry - avg).abs() / avg > 0.0005;
+                if pos.qty != *qty || price_drift {
+                    tracing::warn!(
+                        "[reconcile] {code}: internal {}주@{:.0} → account {}주@{:.0} 로 보정",
+                        pos.qty, pos.entry, qty, avg
+                    );
+                    let entry = if *avg > 0.0 { *avg } else { pos.entry };
+                    s.risk.sync_position(code, entry, *qty);
+                }
+            }
+            None => {
+                tracing::warn!("[reconcile] {code}: 계좌에 없음 — 내부 포지션 제거 (외부 매도/미체결 추정)");
+                s.risk.forget(code);
+                s.opened_meta.remove(code);
+                s.bars_held.remove(code);
+            }
+        }
+    }
+    let tracked_codes: HashSet<&String> = tracked.iter().map(|(c, _)| c).collect();
+    let mut unmanaged: Vec<String> = acct.keys().filter(|c| !tracked_codes.contains(c)).cloned().collect();
+    unmanaged.sort();
+    s.unmanaged_holdings = unmanaged;
+}
+
+/// End-of-day handling phase for the current KST time (day-trading flatten).
+#[derive(PartialEq, Clone, Copy)]
+enum EodPhase {
+    Normal,
+    NoEntry, // close is near — hold/manage but no new entries
+    Flatten, // force-close everything before the session ends
+}
+
+/// EOD phase: entries stop at 15:05, everything is flattened from 15:10 (the
+/// engine's session ends 15:20). Only active when `eod_flatten` is on and real
+/// market hours are respected — ignoring hours (off-hours testing) would
+/// otherwise flatten instantly at any evening test run.
+fn eod_phase(s: &State) -> EodPhase {
+    if !s.risk.cfg.eod_flatten || s.ignore_market_hours {
+        return EodPhase::Normal;
+    }
+    let now = Utc::now().with_timezone(&Seoul);
+    let mins = now.hour() * 60 + now.minute();
+    if mins >= 15 * 60 + 10 {
+        EodPhase::Flatten
+    } else if mins >= 15 * 60 + 5 {
+        EodPhase::NoEntry
+    } else {
+        EodPhase::Normal
+    }
+}
+
 /// One full cycle over the watchlist + held codes.
 async fn scan_and_trade(deps: &Deps, state: &Arc<Mutex<State>>, token: &str) -> Result<(), String> {
     // Snapshot codes under the lock (timeframe is resolved per symbol below).
+    // Held positions come *first* — their stop/exit checks must not wait behind
+    // a long watchlist scan (each fetch pays the ~1.1s/call eBest rate limit).
     let codes = {
         let s = state.lock().await;
-        let mut codes: Vec<String> = s.watchlist.clone();
-        for code in s.risk.open_positions().keys() {
+        let mut codes: Vec<String> = s.risk.open_positions().keys().cloned().collect();
+        codes.sort();
+        for code in &s.watchlist {
             if !codes.contains(code) {
                 codes.push(code.clone());
             }
@@ -593,9 +854,27 @@ async fn scan_and_trade(deps: &Deps, state: &Arc<Mutex<State>>, token: &str) -> 
         s.monitor.retain(|c, _| codes.contains(c));
     }
 
+    let eod = { eod_phase(&*state.lock().await) };
+
     for code in codes {
         // Each symbol trades on its assigned strategy's recommended timeframe.
         let tf = { state.lock().await.tf_for(&code) };
+        // Bar-close scheduling: a non-held symbol only needs a fetch once its
+        // TF bar could have closed since the last one we processed. Skipping
+        // the rest keeps the cycle inside the eBest rate-limit budget for
+        // large watchlists (its previous monitor row simply stays in place).
+        // Held symbols are always fetched — their stops track the live price.
+        {
+            let s = state.lock().await;
+            let held = s.risk.position(&code).is_some();
+            if !held {
+                if let Some(&prev_ts) = s.last_bar_ts.get(&code) {
+                    if kst_wallclock_unix() < prev_ts + tf_secs(tf) {
+                        continue;
+                    }
+                }
+            }
+        }
         let candles = deps.fetcher.fetch(token, &code, tf).await;
         if candles.len() < 21 {
             let mut s = state.lock().await;
@@ -603,7 +882,7 @@ async fn scan_and_trade(deps: &Deps, state: &Arc<Mutex<State>>, token: &str) -> 
             continue;
         }
         // Last bar is still forming → its price is only used for hard stop / averaging.
-        let live_price = candles.last().unwrap().close;
+        let mut live_price = candles.last().unwrap().close;
         let closed = &candles[..candles.len() - 1];
         if closed.len() < 20 {
             continue;
@@ -613,16 +892,56 @@ async fn scan_and_trade(deps: &Deps, state: &Arc<Mutex<State>>, token: &str) -> 
         let bar_ts = candle_unix_ts(&closed[closed.len() - 1]);
         let live_ts = candle_unix_ts(candles.last().unwrap());
 
+        let holds = { state.lock().await.risk.position(&code).is_some() };
+        // The intrabar hard stop advertises "실시간가" — but the candle cache can
+        // be up to its TTL stale (35–90s). For held positions with the hard stop
+        // armed, pull the true current price (t1101) so a crash is caught now.
+        if holds {
+            let hard = { state.lock().await.risk.cfg.hard_stop_intrabar };
+            if hard {
+                if let Some(p) = fresh_price(deps, token, &code).await {
+                    live_price = p;
+                }
+            }
+        }
         let equity = {
             let mut s = state.lock().await;
             s.current_prices.insert(code.clone(), live_price);
             s.equity()
         };
-        let new_bar = { state.lock().await.last_bar_ts.get(&code).copied() != Some(bar_ts) };
-        let holds = { state.lock().await.risk.position(&code).is_some() };
+        // How many closed bars arrived since the one we last processed. With a
+        // large watchlist a cycle can take minutes, so several bars may have
+        // closed — signals on those bars must still be seen (scan window),
+        // and bar-counted state (cooldown, guards, bars_held) must advance by
+        // the same amount instead of one per cycle.
+        let missed: i64 = {
+            let s = state.lock().await;
+            match s.last_bar_ts.get(&code) {
+                None => 1,
+                Some(&prev_ts) => match closed.iter().rev().position(|c| candle_unix_ts(c) == prev_ts) {
+                    Some(p) => (p as i64).min(MISSED_BARS_CAP),
+                    None => MISSED_BARS_CAP, // last-seen bar rolled out of history — long gap
+                },
+            }
+        };
+        let new_bar = missed > 0;
+
+        // EOD flatten: force-close held positions, no new entries near the close.
+        if eod == EodPhase::Flatten {
+            if holds {
+                exit(deps, state, token, &code, live_price, "eod_flatten", live_ts).await;
+            }
+            let mut s = state.lock().await;
+            if new_bar {
+                s.last_bar_ts.insert(code.clone(), bar_ts);
+            }
+            s.record_monitor(&code, bar_price, live_price, atr,
+                Eval::new("마감청산", "장 마감 전 강제 청산 시간 (15:10~) — 신규 진입 없음"));
+            continue;
+        }
 
         if holds {
-            manage_open(deps, state, token, &code, live_price, bar_price, atr, new_bar, live_ts, bar_ts).await;
+            manage_open(deps, state, token, &code, live_price, bar_price, atr, missed, live_ts, bar_ts).await;
             if new_bar {
                 state.lock().await.last_bar_ts.insert(code.clone(), bar_ts);
             }
@@ -652,13 +971,23 @@ async fn scan_and_trade(deps: &Deps, state: &Arc<Mutex<State>>, token: &str) -> 
             s.last_bar_ts.insert(code.clone(), bar_ts);
             let cd = s.cooldown.get(&code).copied().unwrap_or(0);
             if cd > 0 {
-                s.cooldown.insert(code.clone(), cd - 1);
-                s.record_monitor(&code, bar_price, live_price, atr,
-                    Eval::new("쿨다운", format!("재진입 금지 {cd}봉 남음")));
-                continue;
+                // Advance by the bars actually elapsed, not one per cycle.
+                let remaining = (cd - missed).max(0);
+                s.cooldown.insert(code.clone(), remaining);
+                if remaining > 0 {
+                    s.record_monitor(&code, bar_price, live_price, atr,
+                        Eval::new("쿨다운", format!("재진입 금지 {remaining}봉 남음")));
+                    continue;
+                }
             }
         }
-        let eval = try_enter(deps, state, token, &code, closed, bar_price, atr, equity, bar_ts, tf).await;
+        if eod == EodPhase::NoEntry {
+            let mut s = state.lock().await;
+            s.record_monitor(&code, bar_price, live_price, atr,
+                Eval::new("마감임박", "장 마감 임박 (15:05~) — 신규 진입 중단"));
+            continue;
+        }
+        let eval = try_enter(deps, state, token, &code, closed, bar_price, atr, equity, bar_ts, tf, missed).await;
         {
             let mut s = state.lock().await;
             s.record_monitor(&code, bar_price, live_price, atr, eval);
@@ -668,6 +997,7 @@ async fn scan_and_trade(deps: &Deps, state: &Arc<Mutex<State>>, token: &str) -> 
 }
 
 /// Manage a held position: optional intrabar hard stop + closed-bar exits + averaging.
+/// `new_bars` = closed bars elapsed since the last processed one (0 = none).
 #[allow(clippy::too_many_arguments)]
 async fn manage_open(
     deps: &Deps,
@@ -677,24 +1007,34 @@ async fn manage_open(
     live_price: f64,
     bar_price: f64,
     atr: f64,
-    new_bar: bool,
+    new_bars: i64,
     live_ts: i64,
     bar_ts: i64,
 ) {
+    let new_bar = new_bars > 0;
     let (cfg, held_bars) = {
         let mut s = state.lock().await;
         if new_bar {
-            let h = s.bars_held.get(code).copied().unwrap_or(0) + 1;
+            let h = s.bars_held.get(code).copied().unwrap_or(0) + new_bars;
             s.bars_held.insert(code.to_string(), h);
         }
         (s.risk.cfg.clone(), s.bars_held.get(code).copied().unwrap_or(0))
     };
 
+    // Averaging-down is only allowed while the daily loss limit (realized +
+    // unrealized) is intact — 물타기 must not bypass the loss cap by adding to a
+    // sinking position after the day's risk budget is spent.
+    let may_average = |s: &State, code: &str| -> bool {
+        s.risk.can_average(code) && s.risk.daily_loss_ok(s.equity())
+    };
+
     // 1) Intrabar hard stop (off by default): protect on the forming bar's price.
-    if cfg.hard_stop_intrabar {
+    //    Only when the price stop-loss is enabled at all — `use_stop_loss` off
+    //    disables every price-based stop, intrabar included.
+    if cfg.hard_stop_intrabar && cfg.use_stop_loss {
         let hit = { state.lock().await.risk.hard_stop_hit(code, live_price, cfg.hard_stop_buffer_pct) };
         if hit {
-            let can_avg = { state.lock().await.risk.can_average(code) };
+            let can_avg = { let s = state.lock().await; may_average(&s, code) };
             if can_avg {
                 fib_average_down(deps, state, token, code, live_price, atr, live_ts).await;
             } else {
@@ -709,12 +1049,14 @@ async fn manage_open(
     }
     let reason = { state.lock().await.risk.check_exit(code, bar_price, atr) };
     let Some(reason) = reason else { return };
-    // min_hold: defer profit/trailing exits until min_hold_bars (stops always allowed).
-    if (reason == "take_profit" || reason == "trailing_stop") && held_bars < cfg.min_hold_bars {
+    // min_hold: defer only *trailing* exits. Stops must always fire, and a hit
+    // profit target is banked immediately — deferring it just hands the gain
+    // back when the price mean-reverts before min_hold elapses.
+    if reason == "trailing_stop" && held_bars < cfg.min_hold_bars {
         return;
     }
     if reason == "stop_loss" {
-        let can_avg = { state.lock().await.risk.can_average(code) };
+        let can_avg = { let s = state.lock().await; may_average(&s, code) };
         if can_avg {
             fib_average_down(deps, state, token, code, bar_price, atr, bar_ts).await;
             return;
@@ -750,6 +1092,7 @@ async fn fib_average_down(deps: &Deps, state: &Arc<Mutex<State>>, token: &str, c
     s.cash -= add_qty as f64 * fill.fill_price;
     let pos = s.risk.average_down(code, fill.fill_price, add_qty, atr);
     let lvl = pos.as_ref().map_or(0, |p| p.fib_level);
+    s.persist(deps.broker.mode);
     s.append_event(json!({
         "code": code, "name": name_for(code), "type": "buy", "price": fill.fill_price,
         "qty": add_qty, "pnl": 0.0, "pnl_pct": 0.0, "reason": format!("fib_avg_down_{lvl}"),
@@ -761,13 +1104,23 @@ async fn fib_average_down(deps: &Deps, state: &Arc<Mutex<State>>, token: &str, c
 /// Close (sell) a position, then arm the cooldown / re-buy price guard.
 async fn exit(deps: &Deps, state: &Arc<Mutex<State>>, token: &str, code: &str, price: f64, reason: &str, candle_ts: i64) {
     let (pos, sell_qty, order_type) = {
-        let s = state.lock().await;
+        let mut s = state.lock().await;
+        // In-flight guard: the broker call below runs outside the state lock
+        // (a real HTTP round trip in live mode), so a concurrent manual close
+        // could otherwise sell the same position twice.
+        if s.closing.contains(code) {
+            return;
+        }
         let Some(pos) = s.risk.position(code).cloned() else { return };
-        let sell_qty = if s.order.sell_all || s.order.fixed_qty.is_none() {
+        // Stop-outs / EOD / manual closes always exit in full — partial-selling
+        // into a falling stop leaves the remainder exposed with no protection.
+        let force_full = matches!(reason, "stop_loss" | "eod_flatten" | "manual_close");
+        let sell_qty = if force_full || s.order.sell_all || s.order.fixed_qty.is_none() {
             pos.qty
         } else {
             s.order.fixed_qty.unwrap().min(pos.qty)
         };
+        s.closing.insert(code.to_string());
         (pos, sell_qty, s.order.order_type.clone())
     };
     let fill = match pos.side {
@@ -775,9 +1128,11 @@ async fn exit(deps: &Deps, state: &Arc<Mutex<State>>, token: &str, code: &str, p
         Side::Short => deps.broker.cover(token, code, sell_qty, price, &order_type).await,
     };
     if !fill.ok {
+        state.lock().await.closing.remove(code);
         return;
     }
     let mut s = state.lock().await;
+    s.closing.remove(code);
     let dir = if pos.side == Side::Short { -1.0 } else { 1.0 };
     let pnl = (fill.fill_price - pos.entry) * sell_qty as f64 * dir;
     match pos.side {
@@ -801,16 +1156,28 @@ async fn exit(deps: &Deps, state: &Arc<Mutex<State>>, token: &str, code: &str, p
         if reason == "stop_loss" {
             let cd = s.risk.cfg.loss_cooldown_bars;
             s.cooldown.insert(code.to_string(), cd);
-            s.last_exit_price.insert(code.to_string(), fill.fill_price);
+            // Price guard with a bar-count expiry (0 = never expires) so a
+            // recovered uptrend isn't blocked from re-entry forever.
+            let guard_bars = s.risk.cfg.reentry_guard_expire_bars.max(0);
+            s.last_exit_price.insert(code.to_string(), (fill.fill_price, guard_bars));
         } else {
             let cd = s.risk.cfg.reentry_cooldown_bars;
             s.cooldown.insert(code.to_string(), cd);
             s.last_exit_price.remove(code);
         }
     }
+    s.persist(deps.broker.mode);
+}
+
+/// Find the bar index (in `closed`) a pattern was detected on — its last used candle.
+fn pattern_bar_index(closed: &[Candle], r: &PatternResult) -> Option<usize> {
+    let last = r.candles_used.last()?;
+    closed.iter().rposition(|c| c.ts == last.ts)
 }
 
 /// Entry decision: price guard → signal (closed bar) → confirm → higher-TF trend → MTF → gates → size.
+/// `missed` = closed bars elapsed since the previous evaluation; the pattern
+/// scan covers all of them so slow cycles don't drop signals on skipped bars.
 #[allow(clippy::too_many_arguments)]
 async fn try_enter(
     deps: &Deps,
@@ -823,56 +1190,68 @@ async fn try_enter(
     equity: f64,
     candle_ts: i64,
     tf: Timeframe,
+    missed: i64,
 ) -> Eval {
     let (cfg, strategy) = {
         let s = state.lock().await;
         (s.risk.cfg.clone(), s.strategy_for(code))
     };
 
-    // Re-buy price guard — don't buy back at/above the stop-out price.
+    // Re-buy price guard — don't buy back at/above the stop-out price. The
+    // guard expires after `reentry_guard_expire_bars` closed bars (0 = never),
+    // so a recovered uptrend eventually becomes enterable again.
     {
         let mut s = state.lock().await;
-        if let Some(guard) = s.last_exit_price.get(code).copied() {
-            if price >= guard * (1.0 - cfg.reentry_gap_pct) {
-                return Eval::new("재매수가드", format!("직전 손절가 {:.0} 위 → 재매수 보류", guard));
+        if let Some((guard, bars_left)) = s.last_exit_price.get(code).copied() {
+            if price < guard * (1.0 - cfg.reentry_gap_pct) {
+                s.last_exit_price.remove(code); // price fell below the guard → re-buy allowed
+            } else if bars_left == 0 {
+                // 0 = no expiry — block until the price drops below the guard.
+                return Eval::new("재매수가드", format!("직전 손절가 {:.0} 위 → 재매수 보류 (무기한)", guard));
+            } else {
+                // Advance by the bars actually elapsed since the last evaluation.
+                let remaining = bars_left - missed.max(1);
+                if remaining <= 0 {
+                    s.last_exit_price.remove(code); // guard expired
+                } else {
+                    s.last_exit_price.insert(code.to_string(), (guard, remaining));
+                    return Eval::new("재매수가드",
+                        format!("직전 손절가 {:.0} 위 → 재매수 보류 ({remaining}봉 후 해제)", guard));
+                }
             }
-            s.last_exit_price.remove(code);
         }
     }
 
-    // Confirmation bar: find the pattern on the prior bar, require the last closed bar to confirm.
-    let (scan_input, confirm): (&[Candle], Option<Candle>) = if cfg.require_confirmation {
-        (&closed[..closed.len() - 1], closed.last().cloned())
-    } else {
-        (closed, None)
-    };
-    if scan_input.len() < 13 {
+    if closed.len() < 13 {
         return Eval::new("데이터부족", "패턴 분석 데이터 부족");
     }
 
+    // Scan window: every bar closed since the last evaluation (missed) plus,
+    // when confirmation is on, `confirm_window_bars` older bars whose pattern
+    // may only now be getting its confirming bar.
+    let win_missed = missed.clamp(1, MISSED_BARS_CAP) as usize;
+    let confirm_win = cfg.confirm_window_bars.max(1) as usize;
+    let scan_window = if cfg.require_confirmation { win_missed + confirm_win } else { win_missed };
+
     // Candlestick patterns (windowed) + context setups (VWAP/ORB/EMA over the
     // full session) form a single candidate pool, scored the same way.
-    let mut candidates = deps.detector.scan(scan_input, tf, 0.0, true, &strategy, 1);
+    let mut candidates = deps.detector.scan(closed, tf, 0.0, true, &strategy, scan_window);
     {
-        let ctx = SessionContext::for_tf(scan_input, tf);
-        let ema9 = ema_values(scan_input, 9);
-        let ema20 = ema_values(scan_input, 20);
+        let ctx = SessionContext::for_tf(closed, tf);
+        let ema9 = ema_values(closed, 9);
+        let ema20 = ema_values(closed, 20);
         // Only generate bearish setups when the broker can actually execute a
         // short — otherwise they'd just occupy the candidate pool and possibly
         // outscore a real, executable bullish signal for nothing.
-        let mut setups = detect_setups(
-            scan_input,
-            scan_input.len() - 1,
-            &ctx,
-            &ema9,
-            &ema20,
-            &strategy.enabled_patterns,
-            strategy.allows_short() && deps.broker.supports_short(),
-        );
-        for s in &mut setups {
-            apply_strategy(s, &strategy, false, false, false);
+        let allow_short = strategy.allows_short() && deps.broker.supports_short();
+        for k in 0..scan_window.min(closed.len()) {
+            let i = closed.len() - 1 - k;
+            let mut setups = detect_setups(closed, i, &ctx, &ema9, &ema20, &strategy.enabled_patterns, allow_short);
+            for s in &mut setups {
+                apply_strategy(s, &strategy, false, false, false);
+            }
+            candidates.append(&mut setups);
         }
-        candidates.append(&mut setups);
     }
     // Keep enabled candidates whose direction the strategy *and* the broker permit
     // (paper mirrors live: neither can execute a new short — see `Broker::supports_short`).
@@ -882,35 +1261,71 @@ async fn try_enter(
                 || (r.pattern_type == "bearish" && strategy.allows_short() && deps.broker.supports_short()))
     });
     candidates.sort_by(|a, b| b.composite_score.partial_cmp(&a.composite_score).unwrap_or(std::cmp::Ordering::Equal));
-    let Some(mut top) = candidates.into_iter().next() else {
+    if candidates.is_empty() {
         return Eval::new("신호없음", "매매 패턴 미감지");
+    }
+
+    // Pick the best *actionable* candidate. A candidate fires only once:
+    // - no confirmation: its pattern bar must be one of the newly closed bars
+    // - confirmation: a confirming bar must exist within `confirm_win` bars of
+    //   the pattern, and that confirming bar must itself be newly closed
+    //   (older pattern+confirm pairs were already evaluated in a past cycle).
+    let last_idx = closed.len() - 1;
+    let new_cut = closed.len() - win_missed.min(closed.len()); // indexes >= new_cut are new
+    let mut pending: Option<(f64, String)> = None; // best new-but-unconfirmed signal
+    let mut chosen: Option<(PatternResult, Side)> = None;
+    for cand in candidates {
+        let side = Side::from_pattern_type(&cand.pattern_type);
+        let Some(pi) = pattern_bar_index(closed, &cand) else { continue };
+        if !cfg.require_confirmation {
+            if pi >= new_cut {
+                chosen = Some((cand, side));
+                break;
+            }
+            continue;
+        }
+        let p_high = cand.candles_used.iter().map(|c| c.high).fold(f64::MIN, f64::max);
+        let p_low = cand.candles_used.iter().map(|c| c.low).fold(f64::MAX, f64::min);
+        let p_close = cand.candles_used.last().map(|c| c.close).unwrap_or(0.0);
+        let hi = (pi + confirm_win).min(last_idx);
+        let confirmed = (pi + 1..=hi).any(|j| {
+            if j < new_cut {
+                return false; // this confirmation already fired in a past cycle
+            }
+            let b = &closed[j];
+            match side {
+                Side::Long => b.close > p_high || (b.is_bull() && b.close > p_close),
+                Side::Short => b.close < p_low || (b.is_bear() && b.close < p_close),
+            }
+        });
+        if confirmed {
+            chosen = Some((cand, side));
+            break;
+        }
+        if pending.is_none() && pi + confirm_win > last_idx {
+            // still within its confirmation window — worth reporting as waiting
+            pending = Some((cand.composite_score, cand.pattern_name.clone()));
+        }
+    }
+    let Some((mut top, side)) = chosen else {
+        return match pending {
+            Some((score, name)) => Eval::with_signal(
+                "확인봉대기", format!("{name} 감지 · 확인봉 대기 (패턴 후 {confirm_win}봉 내)"), score, &name),
+            None => Eval::new("신호없음", "매매 패턴 미감지 (새 봉 기준)"),
+        };
     };
-    let side = Side::from_pattern_type(&top.pattern_type);
     // Defensive fallback — candidates are already filtered above, so this
     // should be unreachable, but keep it in case that filter is ever bypassed.
     if side == Side::Short && !deps.broker.supports_short() {
         return Eval::with_signal("숏차단", format!("{} 감지 · 공매도 미지원(모의·실전 공통)", top.pattern_name), top.composite_score, &top.pattern_name);
     }
 
-    // Confirmation bar — direction-aware (longs break up, shorts break down).
-    if let Some(confirm) = &confirm {
-        let pattern_high = top.candles_used.iter().map(|c| c.high).fold(f64::MIN, f64::max);
-        let pattern_low = top.candles_used.iter().map(|c| c.low).fold(f64::MAX, f64::min);
-        let pattern_close = top.candles_used.last().map(|c| c.close).unwrap_or(0.0);
-        let confirmed = match side {
-            Side::Long => confirm.close > pattern_high || (confirm.is_bull() && confirm.close > pattern_close),
-            Side::Short => confirm.close < pattern_low || (confirm.is_bear() && confirm.close < pattern_close),
-        };
-        if !confirmed {
-            tracing::info!("entry unconfirmed {code} ({})", top.pattern_name);
-            return Eval::with_signal("확인봉대기", format!("{} 감지 · 확인봉 미충족", top.pattern_name), top.composite_score, &top.pattern_name);
-        }
-    }
-
     // Higher-TF trend filter — block trades fighting the upper timeframe.
+    // `higher_tf_slope_tolerance` relaxes the gate to "block only on a clear
+    // downtrend" instead of any negative drift.
     if cfg.require_higher_tf_uptrend {
         let mtf = MtfEngine::new(&deps.fetcher, &deps.detector);
-        let up = mtf.higher_tf_uptrend(token, code, tf).await;
+        let up = mtf.higher_tf_uptrend(token, code, tf, cfg.higher_tf_slope_tolerance).await;
         let blocked = match side {
             Side::Long => !up,
             Side::Short => up,
@@ -977,6 +1392,7 @@ async fn try_enter(
     s.opened_meta.insert(code.to_string(), (now_iso(), top.pattern_name.clone()));
     s.bars_held.insert(code.to_string(), 0);
     s.last_exit_price.remove(code);
+    s.persist(deps.broker.mode);
     let action_label = if side == Side::Short { "매도(숏)" } else { "매수" };
     s.append_event(json!({
         "code": code, "name": name_for(code), "side": side.as_str(),

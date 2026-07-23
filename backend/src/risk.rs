@@ -3,6 +3,7 @@
 //! Every entry must pass `can_enter()` + `position_size()`. Stops/targets are
 //! ATR-based with a trailing stop, and a daily loss limit halts new entries.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Fibonacci 1,1,2,3,5,8,… (n≥1) — used for averaging-down quantity multiples.
@@ -29,20 +30,42 @@ pub struct RiskConfig {
     pub take_profit_pct: f64,
     pub daily_loss_limit_pct: f64,
     pub trailing_stop_atr: f64,
+    // Auto-exit condition switches — let the user pick which automatic sell
+    // triggers are active. `use_stop_loss` off removes the price stop entirely,
+    // both its closed-bar and intrabar (hard-stop) variants (⚠️ only EOD
+    // flatten and the daily-loss limit then remain as protection).
+    pub use_stop_loss: bool,
+    pub use_take_profit: bool,
+    pub use_trailing_stop: bool,
     // Re-entry guards (avoid whipsaw: sell low → instantly buy high).
     pub reentry_cooldown_bars: i64,
     pub loss_cooldown_bars: i64,
     pub reentry_gap_pct: f64,
+    /// Bars until the stop-out price guard expires (0 = never expires).
+    /// Without expiry a stop-out would block re-entry forever once the price
+    /// recovers above the exit — killing every valid trend re-entry.
+    pub reentry_guard_expire_bars: i64,
     // Fibonacci averaging-down (물타기): add instead of selling on a stop signal.
     pub fib_averaging_enabled: bool,
     pub fib_max_levels: i64,
     // Entry-quality gates (avoid catching a falling knife).
     pub require_confirmation: bool,
+    /// How many closed bars after the pattern a confirmation may arrive in.
+    /// 1 = the legacy "very next bar only"; larger values keep a detected
+    /// pattern alive so a slightly late breakout still triggers the entry.
+    pub confirm_window_bars: i64,
     pub require_higher_tf_uptrend: bool,
+    /// Relaxation for the higher-TF trend gate: block longs only when the
+    /// higher-TF slope is *below* −tolerance (fraction of price per bar).
+    /// 0 = strict legacy behavior (any negative slope blocks).
+    pub higher_tf_slope_tolerance: f64,
     // Exit stabilization.
     pub min_hold_bars: i64,
     pub hard_stop_intrabar: bool,
     pub hard_stop_buffer_pct: f64,
+    // End-of-day flatten (day-trading): block new entries near the close and
+    // force-close everything before the session ends (no overnight gap risk).
+    pub eod_flatten: bool,
 }
 
 impl RiskConfig {
@@ -76,16 +99,23 @@ impl RiskConfig {
             "take_profit_pct": self.take_profit_pct,
             "daily_loss_limit_pct": self.daily_loss_limit_pct,
             "trailing_stop_atr": self.trailing_stop_atr,
+            "use_stop_loss": self.use_stop_loss,
+            "use_take_profit": self.use_take_profit,
+            "use_trailing_stop": self.use_trailing_stop,
             "reentry_cooldown_bars": self.reentry_cooldown_bars,
             "loss_cooldown_bars": self.loss_cooldown_bars,
             "reentry_gap_pct": self.reentry_gap_pct,
+            "reentry_guard_expire_bars": self.reentry_guard_expire_bars,
             "fib_averaging_enabled": self.fib_averaging_enabled,
             "fib_max_levels": self.fib_max_levels,
             "require_confirmation": self.require_confirmation,
+            "confirm_window_bars": self.confirm_window_bars,
             "require_higher_tf_uptrend": self.require_higher_tf_uptrend,
+            "higher_tf_slope_tolerance": self.higher_tf_slope_tolerance,
             "min_hold_bars": self.min_hold_bars,
             "hard_stop_intrabar": self.hard_stop_intrabar,
             "hard_stop_buffer_pct": self.hard_stop_buffer_pct,
+            "eod_flatten": self.eod_flatten,
         })
     }
 }
@@ -102,23 +132,31 @@ impl Default for RiskConfig {
             take_profit_pct: 0.0,
             daily_loss_limit_pct: 0.03,
             trailing_stop_atr: 2.0,
+            use_stop_loss: true,
+            use_take_profit: true,
+            use_trailing_stop: true,
             reentry_cooldown_bars: 1,
             loss_cooldown_bars: 3,
             reentry_gap_pct: 0.0,
+            reentry_guard_expire_bars: 20,
             fib_averaging_enabled: false,
             fib_max_levels: 0,
             require_confirmation: true,
+            confirm_window_bars: 3,
             require_higher_tf_uptrend: true,
+            higher_tf_slope_tolerance: 0.0,
             min_hold_bars: 1,
             hard_stop_intrabar: false,
             hard_stop_buffer_pct: 0.0,
+            eod_flatten: true,
         }
     }
 }
 
 /// Position direction. Shorts are paper-simulation only (KR retail intraday
 /// shorting is effectively unavailable); the live broker rejects short orders.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Side {
     Long,
     Short,
@@ -138,7 +176,7 @@ impl Side {
 }
 
 /// An open position tracked by the risk manager.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Position {
     pub side: Side,
     pub entry: f64,
@@ -154,12 +192,15 @@ pub struct Position {
 pub struct RiskManager {
     pub cfg: RiskConfig,
     daily_pnl: f64,
+    /// Equity at the start of the trading day — the base the daily-loss limit
+    /// draws down from (so unrealized losses count, not just realized P&L).
+    day_start_equity: f64,
     positions: HashMap<String, Position>,
 }
 
 impl RiskManager {
     pub fn new(cfg: RiskConfig) -> Self {
-        Self { cfg, daily_pnl: 0.0, positions: HashMap::new() }
+        Self { cfg, daily_pnl: 0.0, day_start_equity: 0.0, positions: HashMap::new() }
     }
 
     pub fn open_positions(&self) -> &HashMap<String, Position> {
@@ -179,9 +220,24 @@ impl RiskManager {
         self.positions.values().map(|p| p.entry * p.qty as f64).sum()
     }
 
+    /// Daily-loss check counting *unrealized* losses too: realized P&L against
+    /// the limit, plus the equity drawdown from the day-start equity. Shared by
+    /// new entries and averaging-down adds (so 물타기 can't bypass the limit).
+    pub fn daily_loss_ok(&self, equity: f64) -> bool {
+        if self.daily_pnl <= -equity * self.cfg.daily_loss_limit_pct {
+            return false;
+        }
+        if self.day_start_equity > 0.0
+            && equity <= self.day_start_equity * (1.0 - self.cfg.daily_loss_limit_pct)
+        {
+            return false;
+        }
+        true
+    }
+
     /// Gate new entries on the daily-loss limit and max open positions.
     pub fn can_enter(&self, equity: f64) -> (bool, &'static str) {
-        if self.daily_pnl <= -equity * self.cfg.daily_loss_limit_pct {
+        if !self.daily_loss_ok(equity) {
             return (false, "daily_loss_limit_reached");
         }
         if self.positions.len() >= self.cfg.max_positions {
@@ -223,16 +279,18 @@ impl RiskManager {
     /// Decide whether to exit: returns stop_loss / take_profit / trailing_stop / None.
     /// Comparisons are direction-aware (shorts mirror longs).
     pub fn check_exit(&mut self, code: &str, price: f64, atr: f64) -> Option<&'static str> {
+        let (use_sl, use_tp, use_trail) =
+            (self.cfg.use_stop_loss, self.cfg.use_take_profit, self.cfg.use_trailing_stop);
         let pos = self.positions.get_mut(code)?;
         match pos.side {
             Side::Long => {
                 pos.peak = pos.peak.max(price);
                 let trail = pos.peak - atr * self.cfg.trailing_stop_atr;
-                if price <= pos.stop {
+                if use_sl && price <= pos.stop {
                     Some("stop_loss")
-                } else if price >= pos.target {
+                } else if use_tp && price >= pos.target {
                     Some("take_profit")
-                } else if price <= trail && price > pos.entry {
+                } else if use_trail && price <= trail && price > pos.entry {
                     Some("trailing_stop")
                 } else {
                     None
@@ -241,11 +299,11 @@ impl RiskManager {
             Side::Short => {
                 pos.peak = pos.peak.min(price);
                 let trail = pos.peak + atr * self.cfg.trailing_stop_atr;
-                if price >= pos.stop {
+                if use_sl && price >= pos.stop {
                     Some("stop_loss")
-                } else if price <= pos.target {
+                } else if use_tp && price <= pos.target {
                     Some("take_profit")
-                } else if price >= trail && price < pos.entry {
+                } else if use_trail && price >= trail && price < pos.entry {
                     Some("trailing_stop")
                 } else {
                     None
@@ -322,8 +380,43 @@ impl RiskManager {
         }
     }
 
-    pub fn reset_daily(&mut self) {
+    /// Reset the daily P&L and re-anchor the drawdown base at today's opening equity.
+    pub fn reset_daily(&mut self, day_start_equity: f64) {
         self.daily_pnl = 0.0;
+        self.day_start_equity = day_start_equity;
+    }
+
+    // --- persistence support (engine snapshot restore) ---
+
+    /// Replace all open positions (snapshot restore after a backend restart).
+    pub fn restore_positions(&mut self, positions: HashMap<String, Position>) {
+        self.positions = positions;
+    }
+
+    /// Restore the running daily P&L (only for a same-day snapshot).
+    pub fn set_daily_pnl(&mut self, pnl: f64) {
+        self.daily_pnl = pnl;
+    }
+
+    pub fn day_start_equity(&self) -> f64 {
+        self.day_start_equity
+    }
+    pub fn set_day_start_equity(&mut self, v: f64) {
+        self.day_start_equity = v;
+    }
+
+    /// Overwrite one position's entry/qty from the real account (live reconcile).
+    /// Stop/target are kept — they were placed off the strategy, not the fill.
+    pub fn sync_position(&mut self, code: &str, entry: f64, qty: i64) {
+        if let Some(p) = self.positions.get_mut(code) {
+            p.entry = entry;
+            p.qty = qty;
+        }
+    }
+
+    /// Drop a position without journaling (it no longer exists in the account).
+    pub fn forget(&mut self, code: &str) -> Option<Position> {
+        self.positions.remove(code)
     }
 }
 

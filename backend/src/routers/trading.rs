@@ -167,16 +167,23 @@ fn risk_config(body: &Value, settings: &Settings) -> RiskConfig {
         take_profit_pct: f("take_profit_pct", 0.0),
         daily_loss_limit_pct: f("daily_loss_limit_pct", settings.trading_daily_loss_limit),
         trailing_stop_atr: f("trailing_stop_atr", 2.0),
+        use_stop_loss: b("use_stop_loss", true),
+        use_take_profit: b("use_take_profit", true),
+        use_trailing_stop: b("use_trailing_stop", true),
         reentry_cooldown_bars: i("reentry_cooldown_bars", 1),
         loss_cooldown_bars: i("loss_cooldown_bars", 3),
         reentry_gap_pct: f("reentry_gap_pct", 0.0),
+        reentry_guard_expire_bars: i("reentry_guard_expire_bars", 20),
         fib_averaging_enabled: b("fib_averaging_enabled", false),
         fib_max_levels: i("fib_max_levels", 0),
         require_confirmation: b("require_confirmation", true),
+        confirm_window_bars: i("confirm_window_bars", 3),
         require_higher_tf_uptrend: b("require_higher_tf_uptrend", true),
+        higher_tf_slope_tolerance: f("higher_tf_slope_tolerance", 0.0),
         min_hold_bars: i("min_hold_bars", 1),
         hard_stop_intrabar: b("hard_stop_intrabar", false),
         hard_stop_buffer_pct: f("hard_stop_buffer_pct", 0.0),
+        eod_flatten: b("eod_flatten", true),
     }
 }
 
@@ -204,8 +211,13 @@ async fn filter_tradeable(
     watchlist: &[String],
     tf: Timeframe,
     risk: &RiskConfig,
-) -> (Vec<String>, Vec<String>) {
-    let token = st.ebest.auth_token(false).await.unwrap_or_default();
+) -> Result<(Vec<String>, Vec<String>), (StatusCode, String)> {
+    // An auth failure must be surfaced, not swallowed: with an empty token every
+    // fetch returns no candles, every symbol fails OOS, and the user sees a
+    // misleading "no symbol passed validation" error.
+    let token = st.token().await.map_err(|(code, msg)| {
+        (code, format!("OOS 선별을 수행할 수 없습니다 — {msg}"))
+    })?;
     let cost = CostModel::default();
     let (mut kept, mut dropped) = (vec![], vec![]);
     for code in watchlist {
@@ -219,7 +231,7 @@ async fn filter_tradeable(
             dropped.push(code.clone());
         }
     }
-    (kept, dropped)
+    Ok((kept, dropped))
 }
 
 /// `POST /api/trading/start` — start or resume the engine (mode is user-chosen).
@@ -246,7 +258,7 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
     // settings the engine will actually trade with (not the defaults).
     let mut dropped: Vec<String> = vec![];
     if body.get("require_tradeable").and_then(Value::as_bool).unwrap_or(false) {
-        let (kept, drop) = filter_tradeable(&st, &cfg, &symbol_strats, &watchlist, tf, &risk_cfg).await;
+        let (kept, drop) = filter_tradeable(&st, &cfg, &symbol_strats, &watchlist, tf, &risk_cfg).await?;
         watchlist = kept;
         dropped = drop;
         if watchlist.is_empty() {
@@ -262,7 +274,12 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
         tracing::warn!("live mode: order_type '{}' → 'market' 로 강제 (미체결 대사 미구현)", order_cfg.order_type);
         order_cfg.order_type = "market".into();
     }
-    let ignore_hours = body.get("ignore_market_hours").and_then(Value::as_bool).unwrap_or(false);
+    let mut ignore_hours = body.get("ignore_market_hours").and_then(Value::as_bool).unwrap_or(false);
+    // 실전에서 장시간 무시는 스테일 봉 기반 실주문 + EOD 청산 무력화로 이어진다 — 항상 강제 해제.
+    if mode == TradingMode::Live && ignore_hours {
+        tracing::warn!("live mode: ignore_market_hours → false 로 강제");
+        ignore_hours = false;
+    }
     let reset = body.get("reset").and_then(Value::as_bool).unwrap_or(false);
 
     // Hold the engine slot lock across check + reuse/create so two concurrent
@@ -296,7 +313,34 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
 
     // Reuse the existing engine (keep positions/cash) only when same mode + not resetting.
     let reuse = matches!(&*guard, Some(e) if !reset && e.mode() == mode);
+
+    // Discarding a previous engine (mode switch or reset) drops its open
+    // positions from tracking. That must never happen silently — require an
+    // explicit `confirm_discard` from the caller when positions are held.
+    if !reuse {
+        if let Some(old) = &*guard {
+            let old_status = old.status().await;
+            let held: Vec<String> = old_status["positions"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|p| p["code"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let confirmed = body.get("confirm_discard").and_then(Value::as_bool).unwrap_or(false);
+            if !held.is_empty() && !confirmed {
+                return Err((StatusCode::CONFLICT, format!(
+                    "DISCARD_CONFIRM:이전 {} 엔진에 보유 포지션 {}건({})이 있습니다. \
+                     새로 시작하면 이 포지션들의 자동 관리(손절/익절)가 중단됩니다.",
+                    old.mode().as_str(), held.len(), held.join(", ")
+                )));
+            }
+        }
+    }
+
     let engine: Arc<TradingEngine>;
+    let mut restored = false;
     if reuse {
         engine = guard.clone().unwrap();
         engine
@@ -308,6 +352,9 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
         // only reference to it — otherwise its spawned task would keep trading.
         if let Some(old) = guard.take() {
             old.stop().await;
+        }
+        if reset {
+            TradingEngine::clear_snapshot(mode);
         }
         let broker = Broker::new(Some(st.ebest.clone()), mode);
         let new_engine = Arc::new(TradingEngine::new(
@@ -325,7 +372,11 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
             settings.trading_paper_seed,
             order_cfg,
         ));
-        new_engine.start(poll_sec, false).await;
+        // Restore this mode's saved positions/cash (backend-restart recovery)
+        // unless the caller explicitly asked for a reset. Only state is
+        // restored — the config is the fresh one passed to `new()` above.
+        restored = !reset && new_engine.restore_snapshot().await;
+        new_engine.start(poll_sec, restored).await;
         *guard = Some(new_engine.clone());
         engine = new_engine;
     }
@@ -342,7 +393,8 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
         json!({"recommended": false, "message": "검증 기준 미달 상태에서 실전투자를 시작했습니다. 권장: 모의투자로 충분히 검증하세요.", "failed_criteria": failed})
     };
     Ok(Json(json!({
-        "ok": true, "mode": mode.as_str(), "resumed": reuse, "dropped_untradeable": dropped,
+        "ok": true, "mode": mode.as_str(), "resumed": reuse, "restored_from_snapshot": restored,
+        "dropped_untradeable": dropped,
         "status": engine.status().await, "readiness_advisory": advisory,
     })))
 }

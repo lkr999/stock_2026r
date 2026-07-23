@@ -67,7 +67,7 @@ impl Settings {
             cors_origins: s("CORS_ORIGINS", "http://localhost:5173"),
             trading_mode: s("TRADING_MODE", "paper"),
             trading_default_strategy: s("TRADING_DEFAULT_STRATEGY", "balanced"),
-            trading_max_positions: n("TRADING_MAX_POSITIONS", 5),
+            trading_max_positions: n("TRADING_MAX_POSITIONS", 10),
             trading_risk_per_trade: n("TRADING_RISK_PER_TRADE", 0.01),
             trading_daily_loss_limit: n("TRADING_DAILY_LOSS_LIMIT", 0.03),
             trading_paper_seed: n("TRADING_PAPER_SEED", 10_000_000.0),
