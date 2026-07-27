@@ -57,6 +57,30 @@ pub fn ema_values(candles: &[Candle], period: usize) -> Vec<f64> {
     ema_array(&closes(candles), period)
 }
 
+/// Raw Wilder RSI array (`NaN` during warmup) — for setup logic.
+pub fn rsi_values(candles: &[Candle], period: usize) -> Vec<f64> {
+    rsi(candles, period)
+        .into_iter()
+        .map(|v| v.unwrap_or(f64::NAN))
+        .collect()
+}
+
+/// Raw Bollinger arrays (upper, lower, relative width) (`NaN` during warmup) —
+/// for setup logic. Width = (upper − lower) / mid, the squeeze measure.
+pub fn bollinger_values(candles: &[Candle], period: usize, mult: f64) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let (mid, upper, lower) = bollinger(candles, period, mult);
+    let to_raw = |s: &Series| -> Vec<f64> { s.iter().map(|v| v.unwrap_or(f64::NAN)).collect() };
+    let width: Vec<f64> = mid
+        .iter()
+        .zip(upper.iter().zip(lower.iter()))
+        .map(|(m, (u, l))| match (m, u, l) {
+            (Some(m), Some(u), Some(l)) if *m > 0.0 => (u - l) / m,
+            _ => f64::NAN,
+        })
+        .collect();
+    (to_raw(&upper), to_raw(&lower), width)
+}
+
 /// Map a `f64` series (NaN = no value) to the aligned `Option` series.
 fn from_raw(a: &[f64]) -> Series {
     a.iter().map(|&v| if v.is_finite() { Some(v) } else { None }).collect()

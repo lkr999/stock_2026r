@@ -6,6 +6,7 @@ use crate::ebest::EBestService;
 use crate::engine::TradingEngine;
 use crate::journal::TradeJournal;
 use crate::pattern::PatternDetector;
+use crate::telegram::TelegramNotifier;
 use axum::http::StatusCode;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -18,6 +19,8 @@ pub struct AppState {
     pub fetcher: Arc<CandleFetcher>,
     pub detector: PatternDetector,
     pub journal: Arc<TradeJournal>,
+    /// stock_monitor 방으로 상태/거래내역 요약을 보내는 텔레그램 알림 클라이언트.
+    pub telegram: Arc<TelegramNotifier>,
     /// The trading engine is created on the first `/trading/start`.
     pub engine: Arc<Mutex<Option<Arc<TradingEngine>>>>,
 }
@@ -33,6 +36,7 @@ impl AppState {
             fetcher,
             detector: PatternDetector,
             journal: Arc::new(TradeJournal::new()),
+            telegram: Arc::new(TelegramNotifier::from_env()),
             engine: Arc::new(Mutex::new(None)),
         }
     }

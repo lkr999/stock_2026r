@@ -213,11 +213,48 @@ pub fn presets() -> Vec<StrategyConfig> {
                 "vwap_reclaim", "vwap_bounce", "vwap_loss", "vwap_reject",
                 "orb_breakout", "orb_breakdown", "ema_pullback_long", "ema_pullback_short",
                 "pin_bar_bull", "pin_bar_bear",
+                "rsi_oversold_bounce", "rsi_overbought_drop",
+                "bb_squeeze_break_up", "bb_squeeze_break_down",
             ]),
             entry_threshold: 0.60,
             direction: "both".into(),
             require_volume_confirm: true,
             min_reward_risk: 1.2,
+            ..Default::default()
+        },
+        // RSI(14) 과매도 반등 / 과매수 하락 — 추격 대신 소진 지점을 사는
+        // 평균회귀형(Connors 계열)이라 역사적으로 승률이 높은 부류의 셋업.
+        // 반전 캔들(해머/핀바/트위저)을 함께 켜 바닥 확인 신호를 보강한다.
+        StrategyConfig {
+            name: "rsi_meanrev".into(),
+            recommended_tf: "5m".into(),
+            weights: w(0.60, 0.15, 0.25, 0.0, 0.0, 0.0),
+            enabled_patterns: setup_patterns(&[
+                "rsi_oversold_bounce", "rsi_overbought_drop",
+                "hammer", "pin_bar_bull", "pin_bar_bear",
+                "tweezer_bottom", "tweezer_top",
+            ]),
+            entry_threshold: 0.58,
+            direction: "both".into(),
+            min_reward_risk: 1.2,
+            ..Default::default()
+        },
+        // 볼린저 스퀴즈 돌파 — 밴드폭이 20봉 최저 부근까지 수축한 뒤 밴드 밖
+        // 종가로 해소될 때 진입 (변동성 수축→확장의 초입을 탄다). 인사이드바
+        // 돌파·마루보주를 함께 켜 돌파 임펄스 신호를 보강한다.
+        StrategyConfig {
+            name: "bb_squeeze".into(),
+            recommended_tf: "5m".into(),
+            weights: w(0.50, 0.15, 0.35, 0.0, 0.0, 0.0),
+            enabled_patterns: setup_patterns(&[
+                "bb_squeeze_break_up", "bb_squeeze_break_down",
+                "inside_bar_break_up", "inside_bar_break_down",
+                "marubozu_bull", "marubozu_bear",
+            ]),
+            entry_threshold: 0.60,
+            direction: "both".into(),
+            require_volume_confirm: true,
+            min_reward_risk: 1.3,
             ..Default::default()
         },
     ]

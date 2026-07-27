@@ -70,20 +70,20 @@
 
 <style>
   header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px; }
-  .back { color: #6c7086; text-decoration: none; font-size: 13px; }
+  .back { color: #a6adc8; text-decoration: none; font-size: 13px; }
   h1 { margin: 6px 0 0; font-size: 22px; }
-  .code { color: #6c7086; font-size: 15px; }
+  .code { color: #a6adc8; font-size: 15px; }
   .grid { display: grid; grid-template-columns: 1fr 300px; gap: 16px; }
   .chart-panel { background: #1e1e2e; border-radius: 10px; padding: 12px; position: relative; }
-  .loading { position: absolute; inset: 0; display: grid; place-items: center; color: #9399b2; z-index: 2; }
+  .loading { position: absolute; inset: 0; display: grid; place-items: center; color: #bac2de; z-index: 2; }
   aside { background: #181825; border-radius: 10px; padding: 16px; }
   aside h3 { margin: 0 0 12px; font-size: 15px; }
   .pcard { margin-bottom: 14px; }
   .phead { margin-bottom: 6px; font-weight: 600; font-size: 14px; }
   .bullish { color: #a6e3a1; }
   .bearish { color: #f38ba8; }
-  .exp { font-size: 11px; color: #6c7086; margin-top: 6px; }
-  .empty { color: #6c7086; font-size: 13px; }
+  .exp { font-size: 11px; color: #a6adc8; margin-top: 6px; }
+  .empty { color: #a6adc8; font-size: 13px; }
   .error { background: #f38ba8; color: #1e1e2e; padding: 10px; border-radius: 6px; margin-bottom: 12px; }
   @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
 </style>

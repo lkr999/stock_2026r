@@ -229,6 +229,8 @@ export const api = {
     ),
   clearEvents: () => jpost<{ ok: boolean; removed: number; status: any }>(`/api/trading/events/clear`, {}),
   clearJournal: (mode = 'all') => jpost<{ ok: boolean; removed: number }>(`/api/trading/journal/clear?mode=${mode}`, {}),
+  // stock_monitor 텔레그램 방으로 상태/모니터링/최근 거래내역 요약을 전송한다.
+  telegramReport: () => jpost<{ ok: boolean }>(`/api/trading/telegram/report`, {}),
 };
 
 export interface CriterionResult {

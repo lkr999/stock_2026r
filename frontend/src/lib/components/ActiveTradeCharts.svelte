@@ -148,18 +148,18 @@
   .tabs button { display: flex; flex-direction: column; align-items: flex-start; background: #1e1e2e; border: 1px solid #45475a; color: #cdd6f4; border-radius: 6px; padding: 4px 10px; cursor: pointer; line-height: 1.2; }
   .tabs button.active { background: #313244; border-color: #89b4fa; }
   .tabs button strong { font-size: 13px; }
-  .cd { color: #6c7086; font-size: 10px; }
-  .meta { margin-left: auto; font-size: 11px; color: #6c7086; }
+  .cd { color: #a6adc8; font-size: 10px; }
+  .meta { margin-left: auto; font-size: 11px; color: #a6adc8; }
   .head { display: flex; justify-content: space-between; align-items: baseline; padding: 4px 4px 8px; }
   .title { font-weight: 700; font-size: 15px; display: flex; align-items: center; gap: 8px; }
   .quote { display: inline-flex; align-items: baseline; gap: 10px; }
   .price { font-variant-numeric: tabular-nums; color: #bac2de; font-weight: 700; font-size: 16px; transition: background 0.2s; border-radius: 4px; padding: 0 4px; }
   .price.flash { background: rgba(249,226,175,0.35); }
   .chg { font-size: 12px; font-variant-numeric: tabular-nums; }
-  .qtime { font-size: 10px; color: #6c7086; }
+  .qtime { font-size: 10px; color: #a6adc8; }
   .up { color: #ef4444; }
   .down { color: #3b82f6; }
-  .empty { color: #6c7086; font-size: 13px; text-align: center; padding: 24px; }
+  .empty { color: #a6adc8; font-size: 13px; text-align: center; padding: 24px; }
   .fetch-error {
     background: #f38ba820; border: 1px solid #f38ba8; border-radius: 8px;
     padding: 16px; color: #f38ba8; font-size: 13px; margin: 8px 0;

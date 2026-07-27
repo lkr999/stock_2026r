@@ -27,7 +27,7 @@
   let orderType = saved.orderType ?? 'limit';          // limit=지정가 | market=시장가 | best=최유리지정가
   let fixedQty = saved.fixedQty ?? 0;                  // 1회 매수/매도 수량 (0=자동 산정)
   let sellAll = saved.sellAll ?? true;                 // 매도 시 전량
-  let maxPositions = saved.maxPositions ?? 10;         // 동시 보유 최대 종목 수
+  let maxPositions = saved.maxPositions ?? 5;          // 동시 보유 최대 종목 수 (분산 5종목이 일반적)
   // 매수 한도액 = 총 진입금액(보유 포지션 전체 합계) 한도. 모의/실전 모드별로 값을
   // 분리 저장한다 — 실전은 잔고금액을, 모의는 이 값을 기본값으로 쓴다.
   let maxBuyAmount = saved.maxBuyAmount ?? 500000;         // 모의투자용
@@ -60,8 +60,9 @@
   $: activeMaxBuyAmount = mode === 'live' ? maxBuyAmountLive : maxBuyAmount;
 
   // 손절·익절 설정 (수동 고정%; 0 = ATR 변동성 기준 자동)
-  let stopLossPct = saved.stopLossPct ?? 0;            // 매수가 대비 손절 % (예: 3 → -3%)
-  let takeProfitPct = saved.takeProfitPct ?? 0;        // 매수가 대비 익절 % (예: 6 → +6%)
+  // 기본 −3% / +6% (손익비 2:1) — 국내 단타에서 가장 널리 쓰는 조합.
+  let stopLossPct = saved.stopLossPct ?? 3;            // 매수가 대비 손절 % (예: 3 → -3%)
+  let takeProfitPct = saved.takeProfitPct ?? 6;        // 매수가 대비 익절 % (예: 6 → +6%)
 
   // 자동 매도(청산) 조건 — 각 트리거를 개별 on/off
   let useStopLoss = saved.useStopLoss ?? true;         // 손절선 도달 시 청산
@@ -72,10 +73,12 @@
   // 재진입 가드 (whipsaw 방지) + 피보나치 평균매수
   let lossCooldownBars = saved.lossCooldownBars ?? 3;       // 손절 청산 후 진입 금지 봉수
   let reentryCooldownBars = saved.reentryCooldownBars ?? 1; // 익절 청산 후 진입 금지 봉수
-  let reentryGapPct = saved.reentryGapPct ?? 0;             // 손절가 × (1-이값) 이하에서만 재매수 (%)
+  let reentryGapPct = saved.reentryGapPct ?? 1;             // 손절가 × (1-이값) 이하에서만 재매수 (%) — 1%가 일반적
   let reentryGuardExpireBars = saved.reentryGuardExpireBars ?? 20; // 가격가드 자동 해제 봉수 (0=무기한)
   let fibEnabled = saved.fibEnabled ?? false;              // 피보나치 평균매수(물타기) 사용
-  let fibMaxLevels = saved.fibMaxLevels ?? 3;              // 물타기 최대 차수
+  // 기본 2차 권장 — 3차부터 추가수량(피보나치 1·1·2·3·5)이 급증해 하락장 손실이
+  // 기하급수로 커진다. 백엔드도 최대 5차로 강제 제한한다.
+  let fibMaxLevels = saved.fibMaxLevels ?? 2;              // 물타기 최대 차수
 
   // 진입 품질 게이트 + 청산 안정화 + OOS 선별
   let requireConfirmation = saved.requireConfirmation ?? true;        // 확인봉(양봉/고점돌파)에서만 진입
@@ -83,8 +86,10 @@
   let requireHigherTfUptrend = saved.requireHigherTfUptrend ?? true;  // 상위 TF 하락 시 롱 진입 금지
   let higherTfTolerancePct = saved.higherTfTolerancePct ?? 0;         // 허용 하락 기울기 %/봉 (0=엄격)
   let minHoldBars = saved.minHoldBars ?? 1;                  // 익절/트레일링 최소 보유봉수
-  let hardStopIntrabar = saved.hardStopIntrabar ?? false;    // 형성 중 봉 실시간가로 손절(off=닫힌 봉)
-  let hardStopBufferPct = saved.hardStopBufferPct ?? 0;      // intrabar 손절 버퍼(%)
+  // 실시간 손절 기본 ON + 버퍼 0.5% — 봉 마감 전 급락을 놓치지 않으면서
+  // 틱 노이즈로 인한 조기 손절은 버퍼로 거른다 (단타 표준 구성).
+  let hardStopIntrabar = saved.hardStopIntrabar ?? true;     // 형성 중 봉 실시간가로 손절(off=닫힌 봉)
+  let hardStopBufferPct = saved.hardStopBufferPct ?? 0.5;    // intrabar 손절 버퍼(%)
   let eodFlatten = saved.eodFlatten ?? true;                 // 장 마감 전 강제 청산(오버나이트 갭 방지)
   let requireTradeable = saved.requireTradeable ?? true;     // OOS 검증 통과 종목만 매매
 
@@ -252,6 +257,19 @@
     }
   }
 
+  let telegramSending = false;
+  async function sendTelegram() {
+    telegramSending = true;
+    try {
+      await api.telegramReport();
+      alert('stock_monitor 텔레그램 방으로 전송했습니다.');
+    } catch (e) {
+      error = String(e);
+      alert('텔레그램 전송 실패: ' + String(e));
+    } finally {
+      telegramSending = false;
+    }
+  }
   async function clearSessionEvents() {
     if (!confirm('이번 세션 거래 기록과 차트의 매수/매도 마커를 모두 지웁니다. 계속할까요?')) return;
     try { await api.clearEvents(); await refreshStatus(); } catch (e) { error = String(e); }
@@ -507,6 +525,10 @@
       {:else}
         <button class="start" on:click={() => start()}>▶ 시작</button>
       {/if}
+      <button class="reapply" on:click={sendTelegram} disabled={telegramSending}
+        title="현재 상태 · 모니터링 현황 · 최근 40건 거래내역을 stock_monitor 텔레그램 방으로 전송합니다">
+        {telegramSending ? '전송 중…' : '✈️ 텔레그램 전송'}
+      </button>
       {#if liveAdvisory}<span class="gate-note">⚠️ 검증 미달(참고) — 시작은 가능하나 모의투자 검증을 권장합니다</span>{/if}
     </div>
   </section>
@@ -554,6 +576,8 @@
     </div>
     <p class="hint">
       1회 수량 0이면 리스크 기준(자본 1%·ATR)으로 자동 산정합니다.
+      실전 지정가/최유리 주문은 접수 후 약 15초간 체결을 확인하고, 미체결 잔량은 자동 취소한 뒤
+      <b>실제 체결수량·평균체결가만 포지션에 반영</b>합니다.
       매수 한도액은 <b>1회 주문이 아니라 보유 포지션 전체의 진입금액 합계</b>에 대한 한도이며,
       새 진입은 (한도액 − 현재 총 진입금액)과 가용현금 중 작은 값으로 제한됩니다.
       {#if mode === 'live'}실전투자는 기본값으로 계좌 잔고의 50%(현재 {activeMaxBuyAmount.toLocaleString()}원)를 사용합니다 — 필요 시 직접 조정하세요.{/if}
@@ -678,8 +702,8 @@
     </div>
     <div class="row">
       <label>최대 차수</label>
-      <input type="number" bind:value={fibMaxLevels} min="1" max="10" disabled={!fibEnabled} />
-      <span class="unit">차 (예: 3 → 최대 3회 추가매수)</span>
+      <input type="number" bind:value={fibMaxLevels} min="1" max="5" disabled={!fibEnabled} />
+      <span class="unit">차 (권장 ≤2 · 최대 5 — 3차부터 추가수량 급증)</span>
     </div>
   </section>
 
@@ -1033,9 +1057,9 @@
   h1 { font-size: 22px; margin: 0 0 6px; display: flex; align-items: center; gap: 12px; }
   .run-pill {
     display: inline-flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 700;
-    padding: 4px 12px; border-radius: 12px; background: #313244; color: #9399b2; border: 1px solid #45475a;
+    padding: 4px 12px; border-radius: 12px; background: #313244; color: #bac2de; border: 1px solid #45475a;
   }
-  .run-pill .dot { width: 8px; height: 8px; border-radius: 50%; background: #6c7086; }
+  .run-pill .dot { width: 8px; height: 8px; border-radius: 50%; background: #a6adc8; }
   .run-pill.paper { color: #a6e3a1; border-color: #3a4a3a; }
   .run-pill.paper .dot { background: #a6e3a1; box-shadow: 0 0 6px #a6e3a1; }
   .run-pill.live { color: #f38ba8; border-color: #4a2f36; }
@@ -1045,9 +1069,9 @@
   .card { background: #181825; border-radius: 10px; padding: 16px; }
   .card.status { grid-column: 1 / -1; }
   h3 { margin: 0 0 14px; font-size: 15px; }
-  h4 { margin: 16px 0 8px; font-size: 13px; color: #9399b2; }
+  h4 { margin: 16px 0 8px; font-size: 13px; color: #bac2de; }
   .row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-  .row label { width: 90px; font-size: 13px; color: #9399b2; }
+  .row label { width: 90px; font-size: 13px; color: #bac2de; }
   .row input[type="text"], .row input[type="number"], .row input:not([type]), select { flex: 1; background: #1e1e2e; color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px; padding: 6px 8px; }
   .seg { display: flex; gap: 4px; }
   .seg button { padding: 5px 14px; border: 1px solid #45475a; background: #1e1e2e; color: #cdd6f4; border-radius: 4px; cursor: pointer; }
@@ -1065,18 +1089,18 @@
   .mini { background: #313244; color: #cdd6f4; border: none; border-radius: 4px; padding: 6px 10px; cursor: pointer; font-size: 12px; white-space: nowrap; }
   .mini.stale { background: #f9e2af; color: #1e1e2e; font-weight: 700; }
   .stale-hint { font-size: 12px; color: #f9e2af; background: #2a2717; border: 1px solid #45475a; border-radius: 6px; padding: 6px 10px; margin: -2px 0 10px; }
-  .cd { color: #6c7086; font-size: 11px; }
+  .cd { color: #a6adc8; font-size: 12px; }
   .charts { margin-top: 16px; }
   .charts h3 { margin: 0 0 4px; font-size: 15px; }
-  .chint { font-size: 12px; color: #6c7086; margin: 0 0 12px; }
+  .chint { font-size: 12px; color: #a6adc8; margin: 0 0 12px; }
   .hot { background: #cba6f7; color: #1e1e2e; margin-top: 10px; }
   .wrow { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
   .wrow label { width: 70px; font-size: 13px; color: #bac2de; }
   .wrow input[type="range"] { flex: 1; }
   .wrow span { width: 36px; text-align: right; font-size: 12px; }
-  .hint { font-size: 11px; color: #6c7086; margin-top: 10px; }
+  .hint { font-size: 12px; color: #a6adc8; margin-top: 10px; }
   .warn-hint { color: #f9e2af; }
-  .unit { font-size: 12px; color: #9399b2; white-space: nowrap; }
+  .unit { font-size: 12px; color: #bac2de; white-space: nowrap; }
   .chk { display: flex; align-items: center; gap: 6px; width: auto; color: #cdd6f4; font-size: 13px; }
   .chk input { width: auto; }
   /* 설정 요약 */
@@ -1092,35 +1116,35 @@
   .cfg-group dl { margin: 0; display: flex; flex-direction: column; gap: 4px; }
   .cfg-group dl > div { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; }
   .cfg-group dl > div.wide { flex-direction: column; gap: 2px; }
-  .cfg-group dt { color: #6c7086; white-space: nowrap; }
+  .cfg-group dt { color: #a6adc8; white-space: nowrap; }
   .cfg-group dd { margin: 0; color: #cdd6f4; font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
   .cfg-group dl > div.wide dd { text-align: left; font-weight: 500; word-break: break-all; }
-  .cfg-group dd.muted { color: #6c7086; font-weight: 400; }
+  .cfg-group dd.muted { color: #a6adc8; font-weight: 400; }
   .stat { display: flex; gap: 24px; flex-wrap: wrap; font-size: 14px; }
-  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #6c7086; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #a6adc8; }
   .dot.on { background: #a6e3a1; }
   .pos { color: #a6e3a1; } .neg { color: #f38ba8; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  th { text-align: left; padding: 5px 6px; color: #9399b2; border-bottom: 1px solid #313244; font-weight: 500; }
+  th { text-align: left; padding: 5px 6px; color: #bac2de; border-bottom: 1px solid #313244; font-weight: 500; }
   td { padding: 5px 6px; border-bottom: 1px solid #232334; }
   .num { text-align: right; font-variant-numeric: tabular-nums; }
   .num.live { color: #f9e2af; font-weight: 600; }
   .num.buy { color: #cdd6f4; font-weight: 600; }
-  .sig { color: #a6e3a1; font-size: 11px; }
-  .sub-note { font-size: 11px; color: #6c7086; font-weight: 400; }
+  .sig { color: #a6e3a1; font-size: 12px; }
+  .sub-note { font-size: 12px; color: #a6adc8; font-weight: 400; }
   .sym-strats { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
   .sym-chip { background: #1e1e2e; border: 1px solid #313244; border-radius: 10px; padding: 2px 8px; font-size: 12px; }
   .sym-chip b { color: #cba6f7; }
-  .sym-chip em { color: #6c7086; font-style: normal; font-size: 11px; }
+  .sym-chip em { color: #a6adc8; font-style: normal; font-size: 11px; }
   .strat { white-space: nowrap; }
   .strat-name { color: #cba6f7; font-weight: 600; font-size: 12px; }
-  .strat-name.global { color: #9399b2; font-weight: 500; }
-  .strat-tf { color: #6c7086; font-style: normal; font-size: 11px; margin-left: 4px; }
+  .strat-name.global { color: #bac2de; font-weight: 500; }
+  .strat-tf { color: #a6adc8; font-style: normal; font-size: 11px; margin-left: 4px; }
   .strat-badge {
     margin-left: 4px; padding: 1px 5px; border-radius: 8px;
-    font-size: 10px; color: #6c7086; background: #1e1e2e; border: 1px solid #313244;
+    font-size: 10px; color: #a6adc8; background: #1e1e2e; border: 1px solid #313244;
   }
-  .detail { color: #bac2de; font-size: 11px; }
+  .detail { color: #cdd6f4; font-size: 12px; }
   .phase {
     display: inline-block; padding: 2px 8px; border-radius: 10px;
     font-size: 11px; font-weight: 600; white-space: nowrap;
@@ -1130,7 +1154,7 @@
   .ph-cool  { background: #3a3526; color: #f9e2af; }
   .ph-gate  { background: #3a2f24; color: #fab387; }
   .ph-block { background: #45282f; color: #f38ba8; }
-  .ph-idle  { background: #2a2a3a; color: #9399b2; }
+  .ph-idle  { background: #2a2a3a; color: #bac2de; }
   .ctd { text-align: center; }
   .close-pos {
     background: #45282f; color: #f38ba8; border: 1px solid #f38ba8;
@@ -1138,18 +1162,18 @@
   }
   .close-pos:hover:not(:disabled) { background: #f38ba8; color: #1e1e2e; }
   .close-pos:disabled { opacity: 0.5; cursor: progress; }
-  .liveat { font-size: 11px; color: #6c7086; align-self: center; }
+  .liveat { font-size: 12px; color: #a6adc8; align-self: center; }
   .totals-row { background: #1e1e2e; font-weight: 700; }
   .totals-row td { border-top: 2px solid #45475a; border-bottom: none; }
-  .totals-row td:first-child { color: #9399b2; font-weight: 600; }
+  .totals-row td:first-child { color: #bac2de; font-weight: 600; }
   .limit-compare {
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
     margin-top: 10px; padding: 10px 14px; border-radius: 8px; font-size: 13px;
     background: #1e1e2e; border: 1px solid #45475a;
   }
-  .limit-compare .lc-label { color: #9399b2; }
+  .limit-compare .lc-label { color: #bac2de; }
   .limit-compare .lc-val { font-weight: 700; color: #cdd6f4; }
-  .limit-compare .lc-vs { color: #6c7086; font-size: 11px; }
+  .limit-compare .lc-vs { color: #a6adc8; font-size: 11px; }
   .limit-compare .lc-diff { margin-left: auto; font-size: 13px; }
   .limit-compare.over { border-color: #4a2f36; }
   .limit-compare.over .lc-diff { color: #f38ba8; }
@@ -1162,7 +1186,7 @@
     border-radius: 5px; padding: 4px 10px; font-size: 12px; cursor: pointer;
   }
   .clear-btn:hover { background: #45475a; }
-  .empty { color: #6c7086; text-align: center; }
+  .empty { color: #a6adc8; text-align: center; }
   .error, .err { background: #f38ba8; color: #1e1e2e; padding: 8px; border-radius: 6px; font-size: 12px; margin-top: 8px; }
   .info { background: #313244; color: #89b4fa; border: 1px solid #45475a; padding: 8px 12px; border-radius: 6px; font-size: 12px; margin-top: 8px; }
   .unmanaged { background: #45475a; color: #f9e2af; padding: 8px 12px; border-radius: 6px; font-size: 12px; margin: 8px 0 0; }
@@ -1178,7 +1202,7 @@
   .stats-header h3 { margin: 0; }
   .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
   .sbox { background: #1e1e2e; border-radius: 8px; padding: 10px 14px; }
-  .slabel { font-size: 11px; color: #6c7086; margin-bottom: 4px; }
+  .slabel { font-size: 12px; color: #a6adc8; margin-bottom: 4px; }
   .sval { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
   .journal-scroll { max-height: 280px; overflow-y: auto; }
 </style>

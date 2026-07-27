@@ -10,10 +10,9 @@ use crate::broker::{Broker, TradingMode};
 use crate::candle::Candle;
 use crate::candle_fetcher::CandleFetcher;
 use crate::ebest::EBestService;
-use crate::indicators::ema_values;
 use crate::journal::{now_iso, TradeJournal, TradeRecord};
 use crate::mtf::MtfEngine;
-use crate::pattern::{apply_strategy, compute_atr, detect_setups, PatternDetector, PatternResult};
+use crate::pattern::{apply_strategy, compute_atr, detect_setups, PatternDetector, PatternResult, SetupSeries};
 use crate::risk::{RiskConfig, RiskManager, Side};
 use crate::session::SessionContext;
 use crate::strategy::{Source, StrategyConfig};
@@ -105,6 +104,26 @@ struct Deps {
     broker: Broker,
     journal: Arc<TradeJournal>,
     cost: CostModel,
+    /// 거래 이벤트(진입/청산/물타기/일손실한도) 자동 알림용 — 미설정이면 무시.
+    notifier: Arc<crate::telegram::TelegramNotifier>,
+}
+
+/// 거래 알림을 stock_monitor 방으로 비동기 전송한다 (루프를 블로킹하지 않음).
+fn notify(deps: &Deps, msg: String) {
+    if !deps.notifier.configured() {
+        return;
+    }
+    let n = deps.notifier.clone();
+    tokio::spawn(async move {
+        if let Err(e) = n.send(&msg).await {
+            tracing::warn!("[telegram] 거래 알림 전송 실패: {e}");
+        }
+    });
+}
+
+/// 알림용 모드 라벨.
+fn mode_label(mode: TradingMode) -> &'static str {
+    if mode == TradingMode::Live { "실전" } else { "모의" }
 }
 
 /// Mutable engine state guarded by the engine mutex.
@@ -136,6 +155,8 @@ struct State {
     /// Codes with a close order in flight — blocks a second concurrent close
     /// (manual vs automatic) from double-selling the same position.
     closing: HashSet<String>,
+    /// 일손실 한도 도달 알림을 하루 1회로 제한 (일일 리셋 시 해제).
+    loss_limit_notified: bool,
     /// Live only: account holdings (t0424) the engine does not track — surfaced
     /// in status so orphaned/manual holdings are visible instead of silent.
     unmanaged_holdings: Vec<String>,
@@ -309,9 +330,10 @@ impl TradingEngine {
         journal: Arc<TradeJournal>,
         seed_cash: f64,
         order: OrderConfig,
+        notifier: Arc<crate::telegram::TelegramNotifier>,
     ) -> Self {
         let mode = broker.mode;
-        let deps = Arc::new(Deps { ebest, fetcher, detector, broker, journal, cost: CostModel::default() });
+        let deps = Arc::new(Deps { ebest, fetcher, detector, broker, journal, cost: CostModel::default(), notifier });
         let state = Arc::new(Mutex::new(State {
             strategy,
             symbol_strategies,
@@ -333,6 +355,7 @@ impl TradingEngine {
             bars_held: HashMap::new(),
             current_prices: HashMap::new(),
             closing: HashSet::new(),
+            loss_limit_notified: false,
             unmanaged_holdings: vec![],
             trade_events: vec![],
             monitor: HashMap::new(),
@@ -370,6 +393,10 @@ impl TradingEngine {
         } else {
             let eq = s.equity();
             s.risk.reset_daily(eq);
+            // 봉수 기반 쿨다운/재매수 가격가드는 지난 세션의 것 — 새 거래일에는
+            // 의미가 없고(주말·휴일을 건너뛴 봉 계산이 불확정), 새로 평가한다.
+            s.cooldown.clear();
+            s.last_exit_price.clear();
         }
         tracing::info!("[engine] snapshot restored ({} mode, {n} positions, cash={:.0})", self.mode.as_str(), s.cash);
         true
@@ -501,31 +528,38 @@ impl TradingEngine {
             Side::Long => self.deps.broker.sell(&token, code, qty, price, &order_type).await,
             Side::Short => self.deps.broker.cover(&token, code, qty, price, &order_type).await,
         };
-        if !fill.ok {
+        if !fill.ok || fill.qty <= 0 {
             self.state.lock().await.closing.remove(code);
             return json!({"ok": false, "reason": "order_failed"});
         }
+        // 지정가 부분 체결 대비: 실제 체결수량 기준으로 정산한다.
+        let sold = fill.qty.min(qty);
         let mut s = self.state.lock().await;
         s.closing.remove(code);
         let dir = if side == Side::Short { -1.0 } else { 1.0 };
-        let pnl = (fill.fill_price - entry) * qty as f64 * dir;
+        let pnl = (fill.fill_price - entry) * sold as f64 * dir;
         match side {
-            Side::Long => s.cash += qty as f64 * fill.fill_price,
+            Side::Long => s.cash += sold as f64 * fill.fill_price,
             Side::Short => s.cash += pnl,
         }
         let pnl_pct = if entry != 0.0 { (fill.fill_price - entry) / entry * 100.0 * dir } else { 0.0 };
-        record_close(&self.deps, &mut s, code, &pos, fill.fill_price, "manual_close", qty, true);
-        s.risk.reduce(code, qty, pnl);
+        let fully = sold >= qty;
+        record_close(&self.deps, &mut s, code, &pos, fill.fill_price, "manual_close", sold, fully);
+        s.risk.reduce(code, sold, pnl);
         s.append_event(json!({
             "code": code, "name": name_for(code), "side": side.as_str(),
             "type": if side == Side::Short { "buy" } else { "sell" }, "action": "close",
             "price": fill.fill_price,
-            "qty": qty, "pnl": pnl.round(), "pnl_pct": (pnl_pct * 100.0).round() / 100.0,
+            "qty": sold, "pnl": pnl.round(), "pnl_pct": (pnl_pct * 100.0).round() / 100.0,
             "reason": "manual_close", "ts": candle_ts, "time_label": hhmm_label(),
         }));
         s.persist(self.deps.broker.mode);
-        tracing::info!("MANUAL CLOSE {code} x{qty} @{:.0} pnl={:.0}", fill.fill_price, pnl);
-        json!({"ok": true, "fill_price": fill.fill_price, "qty": qty,
+        tracing::info!("MANUAL CLOSE {code} x{sold} @{:.0} pnl={:.0}", fill.fill_price, pnl);
+        notify(&self.deps, format!(
+            "🔴 [{}] 수동 청산 — {}({code}) {sold}주 @{:.0}\n손익 {:+.0}원 ({pnl_pct:+.2}%)",
+            mode_label(self.deps.broker.mode), name_for(code), fill.fill_price, pnl
+        ));
+        json!({"ok": true, "fill_price": fill.fill_price, "qty": sold,
                "pnl": pnl.round(), "pnl_pct": (pnl_pct * 100.0).round() / 100.0})
     }
 
@@ -655,6 +689,7 @@ async fn run_loop(deps: Arc<Deps>, state: Arc<Mutex<State>>, poll_sec: u64, resu
         s.cash = seed_equity(&deps, &token, s.seed_cash).await;
         let eq = s.equity();
         s.risk.reset_daily(eq);
+        s.loss_limit_notified = false;
     }
     let mut last_day = Utc::now().with_timezone(&Seoul).date_naive();
     loop {
@@ -665,12 +700,18 @@ async fn run_loop(deps: Arc<Deps>, state: Arc<Mutex<State>>, poll_sec: u64, resu
             }
         }
         // KST 날짜가 바뀌면 일일 손익/손실한도를 리셋한다 (엔진을 며칠 켜두는 경우).
+        // 봉수 기반 쿨다운/재매수 가격가드도 함께 초기화 — 세션 경계를 넘긴 가드는
+        // 주말·휴일 봉 계산이 불확정하고(missed-bars 캡), 단타에선 새 세션에서
+        // 새로 평가하는 것이 맞다.
         let today = Utc::now().with_timezone(&Seoul).date_naive();
         if today != last_day {
             last_day = today;
             let mut s = state.lock().await;
             let eq = s.equity();
             s.risk.reset_daily(eq);
+            s.cooldown.clear();
+            s.last_exit_price.clear();
+            s.loss_limit_notified = false;
         }
         let is_open = {
             let g = state.lock().await;
@@ -1085,20 +1126,26 @@ async fn fib_average_down(deps: &Deps, state: &Arc<Mutex<State>>, token: &str, c
         return;
     }
     let fill = deps.broker.buy(token, code, add_qty, price, &order_type).await;
-    if !fill.ok {
+    if !fill.ok || fill.qty <= 0 {
         return;
     }
+    let added = fill.qty.min(add_qty); // 지정가 부분 체결 대비
     let mut s = state.lock().await;
-    s.cash -= add_qty as f64 * fill.fill_price;
-    let pos = s.risk.average_down(code, fill.fill_price, add_qty, atr);
+    s.cash -= added as f64 * fill.fill_price;
+    let pos = s.risk.average_down(code, fill.fill_price, added, atr);
     let lvl = pos.as_ref().map_or(0, |p| p.fib_level);
     s.persist(deps.broker.mode);
     s.append_event(json!({
         "code": code, "name": name_for(code), "type": "buy", "price": fill.fill_price,
-        "qty": add_qty, "pnl": 0.0, "pnl_pct": 0.0, "reason": format!("fib_avg_down_{lvl}"),
+        "qty": added, "pnl": 0.0, "pnl_pct": 0.0, "reason": format!("fib_avg_down_{lvl}"),
         "ts": candle_ts, "time_label": hhmm_label(),
     }));
-    tracing::info!("FIB AVG DOWN {code} lvl={lvl} x{add_qty} @{:.0}", fill.fill_price);
+    tracing::info!("FIB AVG DOWN {code} lvl={lvl} x{added} @{:.0}", fill.fill_price);
+    notify(deps, format!(
+        "💧 [{}] 물타기 {lvl}차 — {}({code}) +{added}주 @{:.0} (평단 {:.0})",
+        mode_label(deps.broker.mode), name_for(code), fill.fill_price,
+        pos.as_ref().map_or(0.0, |p| p.entry)
+    ));
 }
 
 /// Close (sell) a position, then arm the cooldown / re-buy price guard.
@@ -1127,29 +1174,36 @@ async fn exit(deps: &Deps, state: &Arc<Mutex<State>>, token: &str, code: &str, p
         Side::Long => deps.broker.sell(token, code, sell_qty, price, &order_type).await,
         Side::Short => deps.broker.cover(token, code, sell_qty, price, &order_type).await,
     };
-    if !fill.ok {
+    if !fill.ok || fill.qty <= 0 {
         state.lock().await.closing.remove(code);
-        return;
+        return; // 미체결/실패 — 포지션 유지, 다음 사이클에 청산 조건 재평가
     }
+    // 지정가 부분 체결 대비: 실제 체결수량 기준으로 정산한다.
+    let sold = fill.qty.min(sell_qty);
     let mut s = state.lock().await;
     s.closing.remove(code);
     let dir = if pos.side == Side::Short { -1.0 } else { 1.0 };
-    let pnl = (fill.fill_price - pos.entry) * sell_qty as f64 * dir;
+    let pnl = (fill.fill_price - pos.entry) * sold as f64 * dir;
     match pos.side {
-        Side::Long => s.cash += sell_qty as f64 * fill.fill_price,
+        Side::Long => s.cash += sold as f64 * fill.fill_price,
         Side::Short => s.cash += pnl, // short open credited no cash; realize P&L on cover
     }
     let pnl_pct = if pos.entry != 0.0 { (fill.fill_price - pos.entry) / pos.entry * 100.0 * dir } else { 0.0 };
-    let closed = s.risk.reduce(code, sell_qty, pnl);
-    record_close(deps, &mut s, code, &pos, fill.fill_price, reason, sell_qty, closed);
+    let closed = s.risk.reduce(code, sold, pnl);
+    record_close(deps, &mut s, code, &pos, fill.fill_price, reason, sold, closed);
     s.append_event(json!({
         "code": code, "name": name_for(code), "side": pos.side.as_str(),
         "type": if pos.side == Side::Short { "buy" } else { "sell" }, "action": "close",
         "price": fill.fill_price,
-        "qty": sell_qty, "pnl": pnl.round(), "pnl_pct": (pnl_pct * 100.0).round() / 100.0,
+        "qty": sold, "pnl": pnl.round(), "pnl_pct": (pnl_pct * 100.0).round() / 100.0,
         "reason": reason, "ts": candle_ts, "time_label": hhmm_label(),
     }));
-    tracing::info!("EXIT {code} ({reason}) x{sell_qty} pnl={:.0}{}", pnl, if closed { "" } else { " (부분청산)" });
+    tracing::info!("EXIT {code} ({reason}) x{sold} pnl={:.0}{}", pnl, if closed { "" } else { " (부분청산)" });
+    notify(deps, format!(
+        "🔴 [{}] 청산 — {}({code}) {sold}주 @{:.0}\n손익 {:+.0}원 ({pnl_pct:+.2}%) · 사유 {reason}{}",
+        mode_label(deps.broker.mode), name_for(code), fill.fill_price, pnl,
+        if closed { "" } else { " · 부분청산" }
+    ));
     if closed {
         // Re-entry guard: stop-outs cool down longer + block re-buys above the exit price.
         s.bars_held.remove(code);
@@ -1238,15 +1292,14 @@ async fn try_enter(
     let mut candidates = deps.detector.scan(closed, tf, 0.0, true, &strategy, scan_window);
     {
         let ctx = SessionContext::for_tf(closed, tf);
-        let ema9 = ema_values(closed, 9);
-        let ema20 = ema_values(closed, 20);
+        let series = SetupSeries::compute(closed);
         // Only generate bearish setups when the broker can actually execute a
         // short — otherwise they'd just occupy the candidate pool and possibly
         // outscore a real, executable bullish signal for nothing.
         let allow_short = strategy.allows_short() && deps.broker.supports_short();
         for k in 0..scan_window.min(closed.len()) {
             let i = closed.len() - 1 - k;
-            let mut setups = detect_setups(closed, i, &ctx, &ema9, &ema20, &strategy.enabled_patterns, allow_short);
+            let mut setups = detect_setups(closed, i, &ctx, &series, &strategy.enabled_patterns, allow_short);
             for s in &mut setups {
                 apply_strategy(s, &strategy, false, false, false);
             }
@@ -1356,6 +1409,20 @@ async fn try_enter(
     };
     if !can {
         tracing::info!("entry blocked {code}: {why}");
+        // 일손실 한도 도달은 하루 1회 텔레그램으로 즉시 알린다 — 이후 이 날의
+        // 모든 신규 진입이 중단되는 중요 이벤트이므로 지켜보지 않아도 알 수 있게.
+        if why == "daily_loss_limit_reached" {
+            let mut s = state.lock().await;
+            if !s.loss_limit_notified {
+                s.loss_limit_notified = true;
+                let daily = s.risk.daily_pnl();
+                drop(s);
+                notify(deps, format!(
+                    "🚨 [{}] 일손실 한도 도달 — 오늘 신규 진입 중단\n일손익 {daily:+.0}원",
+                    mode_label(deps.broker.mode)
+                ));
+            }
+        }
         return Eval::with_signal("진입제한", format!("{} 감지 · 리스크 한도로 진입 제한 ({why})", top.pattern_name), top.composite_score, &top.pattern_name);
     }
 
@@ -1380,15 +1447,16 @@ async fn try_enter(
         Side::Long => deps.broker.buy(token, code, qty, price, &order_type).await,
         Side::Short => deps.broker.sell_short(token, code, qty, price, &order_type).await,
     };
-    if !fill.ok {
-        return Eval::with_signal("주문실패", format!("{} 진입 주문 실패", top.pattern_name), top.composite_score, &top.pattern_name);
+    if !fill.ok || fill.qty <= 0 {
+        return Eval::with_signal("주문실패", format!("{} 진입 주문 실패(미체결)", top.pattern_name), top.composite_score, &top.pattern_name);
     }
+    let filled = fill.qty.min(qty); // 지정가 부분 체결 대비: 실제 체결수량만 등록
     let mut s = state.lock().await;
     if side == Side::Long {
-        s.cash -= qty as f64 * fill.fill_price; // short opens credit/use no cash in the paper sim
+        s.cash -= filled as f64 * fill.fill_price; // short opens credit/use no cash in the paper sim
     }
     let (stop, target) = s.risk.stop_and_target(fill.fill_price, atr, side);
-    s.risk.register(code, side, fill.fill_price, qty, stop, target);
+    s.risk.register(code, side, fill.fill_price, filled, stop, target);
     s.opened_meta.insert(code.to_string(), (now_iso(), top.pattern_name.clone()));
     s.bars_held.insert(code.to_string(), 0);
     s.last_exit_price.remove(code);
@@ -1398,12 +1466,17 @@ async fn try_enter(
         "code": code, "name": name_for(code), "side": side.as_str(),
         "type": if side == Side::Short { "sell" } else { "buy" }, "action": "open",
         "price": fill.fill_price,
-        "qty": qty, "pnl": 0.0, "pnl_pct": 0.0, "reason": top.pattern_name,
+        "qty": filled, "pnl": 0.0, "pnl_pct": 0.0, "reason": top.pattern_name,
         "ts": candle_ts, "time_label": hhmm_label(),
     }));
-    tracing::info!("ENTER {} {code} x{qty} @{:.0} stop={:.0} target={:.0} ({} {:.2})",
+    tracing::info!("ENTER {} {code} x{filled} @{:.0} stop={:.0} target={:.0} ({} {:.2})",
         side.as_str(), fill.fill_price, stop, target, top.pattern_name, top.composite_score);
-    Eval::with_signal("진입", format!("{} {action_label} {qty}주 @{:.0}", top.pattern_name, fill.fill_price), top.composite_score, &top.pattern_name)
+    notify(deps, format!(
+        "🟢 [{}] 진입 — {}({code}) {} {filled}주 @{:.0}\n{} · 점수 {:.2} · 손절 {:.0} · 익절 {:.0}",
+        mode_label(deps.broker.mode), name_for(code), action_label, fill.fill_price,
+        top.pattern_name, top.composite_score, stop, target
+    ));
+    Eval::with_signal("진입", format!("{} {action_label} {filled}주 @{:.0}", top.pattern_name, fill.fill_price), top.composite_score, &top.pattern_name)
 }
 
 /// Cost/noise entry gates (composite threshold + volume + reward/risk + edge-over-cost).

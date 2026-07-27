@@ -146,7 +146,7 @@
       height,
       layout: {
         background: { type: ColorType.Solid, color: '#181825' },
-        textColor: '#9399b2',
+        textColor: '#bac2de',
         fontSize: 11,
         fontFamily: '-apple-system, "Segoe UI", sans-serif'
       },
@@ -156,8 +156,8 @@
       },
       crosshair: {
         mode: CrosshairMode.Normal,
-        vertLine: { color: '#6c7086', width: 1, style: 2, labelBackgroundColor: '#45475a' },
-        horzLine: { color: '#6c7086', width: 1, style: 2, labelBackgroundColor: '#45475a' }
+        vertLine: { color: '#a6adc8', width: 1, style: 2, labelBackgroundColor: '#45475a' },
+        horzLine: { color: '#a6adc8', width: 1, style: 2, labelBackgroundColor: '#45475a' }
       },
       rightPriceScale: { borderColor: '#313244', scaleMargins: { top: 0.08, bottom: 0.28 } },
       timeScale: { borderColor: '#313244', timeVisible: true, secondsVisible: false, rightOffset: 6 }
@@ -233,12 +233,12 @@
   }
   .legend {
     position: absolute; top: 8px; left: 12px; z-index: 3;
-    display: flex; gap: 12px; font-size: 11px; color: #9399b2;
+    display: flex; gap: 12px; font-size: 11px; color: #bac2de;
     pointer-events: none;
   }
   .legend .up { color: #ef4444; }
   .legend .down { color: #3b82f6; }
-  .legend .vol { color: #6c7086; }
+  .legend .vol { color: #a6adc8; }
   .legend .live { color: #a6e3a1; }
   .tip {
     position: absolute; z-index: 10; pointer-events: none;
@@ -246,9 +246,9 @@
     padding: 7px 9px; font-size: 11px; color: #cdd6f4; min-width: 150px;
     box-shadow: 0 4px 14px rgba(0,0,0,0.5);
   }
-  .tt-time { color: #9399b2; font-size: 10px; margin-bottom: 4px; }
+  .tt-time { color: #bac2de; font-size: 10px; margin-bottom: 4px; }
   .tt-grid { display: grid; grid-template-columns: auto 1fr; gap: 1px 8px; font-variant-numeric: tabular-nums; }
-  .tt-grid span { color: #6c7086; }
+  .tt-grid span { color: #a6adc8; }
   .tt-grid b { text-align: right; }
   .up { color: #ef4444; }
   .down { color: #3b82f6; }

@@ -175,7 +175,9 @@ fn risk_config(body: &Value, settings: &Settings) -> RiskConfig {
         reentry_gap_pct: f("reentry_gap_pct", 0.0),
         reentry_guard_expire_bars: i("reentry_guard_expire_bars", 20),
         fib_averaging_enabled: b("fib_averaging_enabled", false),
-        fib_max_levels: i("fib_max_levels", 0),
+        // 물타기 차수 상한 5차 — 피보나치 수량(1·1·2·3·5)이 그 이상부터는
+        // 기하급수적으로 커져 하락장에서 계좌를 위협한다 (안전장치).
+        fib_max_levels: i("fib_max_levels", 0).clamp(0, 5),
         require_confirmation: b("require_confirmation", true),
         confirm_window_bars: i("confirm_window_bars", 3),
         require_higher_tf_uptrend: b("require_higher_tf_uptrend", true),
@@ -266,14 +268,9 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
         }
     }
 
-    let mut order_cfg = order_config(&body, settings);
-    // 현재 주문 경로는 "접수 성공 = 요청가 체결"로 간주한다. 지정가가 미체결로 남으면
-    // 내부 포지션/현금이 실계좌와 어긋나므로, 체결 대사가 구현되기 전까지 실전은
-    // 시장가만 허용한다 (모의투자는 즉시 체결 시뮬레이션이라 무관).
-    if mode == TradingMode::Live && order_cfg.order_type != "market" {
-        tracing::warn!("live mode: order_type '{}' → 'market' 로 강제 (미체결 대사 미구현)", order_cfg.order_type);
-        order_cfg.order_type = "market".into();
-    }
+    let order_cfg = order_config(&body, settings);
+    // 지정가/최유리 실전 주문은 브로커의 체결 대사(t0425 폴링 → 잔량 취소)가
+    // 실제 체결수량·평균체결가를 확인하므로 시장가 강제가 더 이상 필요 없다.
     let mut ignore_hours = body.get("ignore_market_hours").and_then(Value::as_bool).unwrap_or(false);
     // 실전에서 장시간 무시는 스테일 봉 기반 실주문 + EOD 청산 무력화로 이어진다 — 항상 강제 해제.
     if mode == TradingMode::Live && ignore_hours {
@@ -371,6 +368,7 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
             st.journal.clone(),
             settings.trading_paper_seed,
             order_cfg,
+            st.telegram.clone(),
         ));
         // Restore this mode's saved positions/cash (backend-restart recovery)
         // unless the caller explicitly asked for a reset. Only state is
@@ -418,6 +416,25 @@ async fn status(State(st): State<AppState>) -> ApiResult {
     }
 }
 
+/// `POST /api/trading/telegram/report` — 현재 상태 + 모니터링 + 최근 40건
+/// 거래내역을 정리해 stock_monitor 방으로 즉시 전송한다.
+async fn telegram_report(State(st): State<AppState>) -> ApiResult {
+    let engine = st.engine.lock().await.clone();
+    match crate::telegram::send_status_report(&st.telegram, engine, &st.journal).await {
+        Ok(()) => Ok(Json(json!({"ok": true}))),
+        Err(e) => Err((StatusCode::BAD_GATEWAY, e)),
+    }
+}
+
+/// `POST /api/trading/telegram/test` — 연결 확인용 핑 메시지 전송(설정 검증).
+async fn telegram_test(State(st): State<AppState>) -> ApiResult {
+    let msg = format!("✅ stock_monitor 연결 확인 — {}", crate::journal::now_iso());
+    match st.telegram.send(&msg).await {
+        Ok(()) => Ok(Json(json!({"ok": true}))),
+        Err(e) => Err((StatusCode::BAD_GATEWAY, e)),
+    }
+}
+
 /// `PUT /api/trading/strategy` — swap the live strategy weights.
 async fn update_strategy(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult {
     let engine = st.engine.lock().await.clone();
@@ -443,4 +460,6 @@ pub fn router() -> Router<AppState> {
         .route("/api/trading/stop", post(stop))
         .route("/api/trading/status", get(status))
         .route("/api/trading/strategy", put(update_strategy))
+        .route("/api/trading/telegram/report", post(telegram_report))
+        .route("/api/trading/telegram/test", post(telegram_test))
 }

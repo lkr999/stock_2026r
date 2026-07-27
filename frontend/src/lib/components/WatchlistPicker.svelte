@@ -85,23 +85,23 @@
   .picker { position: relative; }
   .bar { display: flex; align-items: center; gap: 10px; }
   .bar input { flex: 1; background: #1e1e2e; color: #cdd6f4; border: 1px solid #45475a; border-radius: 6px; padding: 7px 10px; }
-  .count { font-size: 12px; color: #9399b2; white-space: nowrap; }
+  .count { font-size: 12px; color: #bac2de; white-space: nowrap; }
   .clear { background: #313244; color: #cdd6f4; border: none; border-radius: 4px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .chip { background: #313244; color: #cdd6f4; border-radius: 12px; padding: 2px 6px 2px 10px; font-size: 12px; display: inline-flex; align-items: center; gap: 5px; }
-  .chip .ccd { color: #6c7086; font-size: 10px; }
+  .chip .ccd { color: #a6adc8; font-size: 10px; }
   .chip button { background: none; border: none; color: #f38ba8; cursor: pointer; font-size: 14px; line-height: 1; }
   .results { position: absolute; z-index: 20; top: 44px; left: 0; right: 0; background: #11111b; border: 1px solid #45475a; border-radius: 8px; padding: 8px; max-height: 360px; overflow-y: auto; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
-  .rhead { font-size: 11px; color: #6c7086; padding: 4px 8px; }
+  .rhead { font-size: 11px; color: #a6adc8; padding: 4px 8px; }
   .row { display: grid; grid-template-columns: 24px 1fr 70px 60px 90px 60px; align-items: center; gap: 8px; width: 100%; background: none; border: none; color: #cdd6f4; padding: 7px 8px; cursor: pointer; text-align: left; border-radius: 6px; font-size: 13px; }
   .row:hover { background: #1e1e2e; }
   .row.sel { background: #1e2030; }
   .star { color: #f9e2af; }
   .nm { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .cd, .mk { color: #6c7086; font-size: 11px; }
+  .cd, .mk { color: #a6adc8; font-size: 11px; }
   .pr { text-align: right; font-variant-numeric: tabular-nums; }
   .up { color: #ef4444; text-align: right; }
   .down { color: #3b82f6; text-align: right; }
-  .empty { color: #6c7086; text-align: center; padding: 16px; font-size: 13px; }
+  .empty { color: #a6adc8; text-align: center; padding: 16px; font-size: 13px; }
   .close { width: 100%; margin-top: 6px; background: #313244; color: #cdd6f4; border: none; border-radius: 6px; padding: 6px; cursor: pointer; }
 </style>

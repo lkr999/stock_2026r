@@ -45,15 +45,24 @@
   let matrix: any = dsaved.matrix ?? null;
   let backtesting = false;
 
-  // ── 3단계: OOS 순수익 기준 관심종목 선정 + 종목별 베스트 전략 배정 ──
-  let oosMinReturn = dsaved.oosMinReturn ?? 0;             // 최소 OOS 순수익(%)
-  let oosMaxPick = dsaved.oosMaxPick ?? 15;             // 최대 선정 종목 수
+  // ── 3단계: OOS 기준 관심종목 선정 + 종목별 베스트 전략 배정 ──
+  // 선정 기준(모두 사용자 설정) — 각 종목의 OOS 순수익 1위(거래有) 전략을 기준으로 판정한다.
+  // 기본값 = 기존 강건성(tradeable) 게이트 기준: 순수익>0 · 일관성≥60% · 신호≥10.
+  // 입력란 placeholder/라벨 표기에도 같은 상수를 써서 단일 출처로 관리한다.
+  const OOS_DEFAULTS = { minReturn: 0, minSignals: 10, minConsistency: 60, requireTradeable: false, rankBy: 'return', maxPick: 15 };
+  let oosMinReturn = dsaved.oosMinReturn ?? OOS_DEFAULTS.minReturn;                  // 최소 OOS 순수익(%)
+  let oosMinSignals = dsaved.oosMinSignals ?? OOS_DEFAULTS.minSignals;              // 최소 OOS 신호수
+  let oosMinConsistency = dsaved.oosMinConsistency ?? OOS_DEFAULTS.minConsistency;  // 최소 OOS 일관성(%)
+  let oosRequireTradeable = dsaved.oosRequireTradeable ?? OOS_DEFAULTS.requireTradeable; // 강건성 통과(✓)만
+  let oosRankBy = dsaved.oosRankBy ?? OOS_DEFAULTS.rankBy;                          // 랭킹 기준: return|consistency|signals
+  let oosMaxPick = dsaved.oosMaxPick ?? OOS_DEFAULTS.maxPick;                       // 최대 선정 종목 수
   let oosSelectMsg = dsaved.oosSelectMsg ?? '';
 
   // 설정·결과가 바뀔 때마다 localStorage 에 저장 → 페이지 이동 후에도 복원된다.
   $: saveDashboardState({
     market, minPrice, maxPrice, candidateLimit, candidates, scanned,
-    btTf, btHold, matrix, oosMinReturn, oosMaxPick, oosSelectMsg,
+    btTf, btHold, matrix, oosMinReturn, oosMinSignals, oosMinConsistency,
+    oosRequireTradeable, oosRankBy, oosMaxPick, oosSelectMsg,
     testCode, apiPanelOpen,
   });
 
@@ -87,25 +96,42 @@
     }
   }
 
-  // 3단계: 백테스트 결과에서 종목마다 OOS 순수익이 가장 높은(통과한) 전략을 골라
-  // 관심종목으로 선정하고 종목별 전략을 배정한다.
+  // 3단계: 백테스트 결과에서 종목마다 OOS 순수익 1위(거래有) 전략을 고른 뒤,
+  // 사용자가 설정한 선정 기준(최소 순수익·신호수·일관성·강건성 통과)으로 걸러
+  // 랭킹 기준으로 정렬해 최대 N종목을 관심종목으로 선정하고 전략을 배정한다.
   function selectFromMatrix() {
     if (!matrix?.items?.length) { error = '먼저 ▶ 백테스트를 실행하세요.'; return; }
-    // 종목마다 실제 거래(OOS 신호>0)가 있은 전략 중 OOS 순수익 1위를 고르고,
-    // 그 값이 임계 이상인 종목만 선정한다. (tradeable 엄격 게이트는 요구하지 않음)
-    const bySymbol = new Map<string, { strategy: string; oos: number; tf: string }>();
+    type Pick = { strategy: string; tf: string; oos: number; consistency: number; signals: number; tradeable: boolean };
+    // 개별 전략(셀)이 설정 기준을 통과하는지. (일관성은 % 입력을 0~1 비율과 비교)
+    const passes = (it: any) =>
+      it.ok &&
+      (it.oos_total_signals ?? 0) > 0 &&
+      (it.oos_avg_return ?? 0) >= oosMinReturn &&
+      (it.oos_total_signals ?? 0) >= oosMinSignals &&
+      (it.oos_consistency ?? 0) * 100 >= oosMinConsistency &&
+      (!oosRequireTradeable || !!it.tradeable);
+    // 종목마다 "기준을 통과하는 전략 중 OOS 순수익 1위"를 대표로 고른다.
+    // → 순수익 1위 전략이 기준 미달이어도, 같은 종목에 통과하는 강건한 전략이
+    //   있으면 그 전략으로 종목을 살린다(먼저 고르고 거르지 않는다).
+    const bySymbol = new Map<string, Pick>();
     for (const it of matrix.items) {
-      if (!it.ok || (it.oos_total_signals ?? 0) <= 0) continue;
+      if (!passes(it)) continue;
       const cur = bySymbol.get(it.shcode);
-      if (!cur || it.oos_avg_return > cur.oos)
-        bySymbol.set(it.shcode, { strategy: it.strategy, oos: it.oos_avg_return, tf: it.tf });
+      if (!cur || (it.oos_avg_return ?? 0) > cur.oos)
+        bySymbol.set(it.shcode, {
+          strategy: it.strategy, tf: it.tf,
+          oos: it.oos_avg_return ?? 0,
+          consistency: it.oos_consistency ?? 0,   // 0~1 비율
+          signals: it.oos_total_signals ?? 0,
+          tradeable: !!it.tradeable,
+        });
     }
-    const picks = [...bySymbol.entries()]
-      .filter(([, v]) => v.oos >= oosMinReturn)
-      .sort((a, b) => b[1].oos - a[1].oos)
-      .slice(0, oosMaxPick);
+    // 랭킹 기준으로 종목 정렬 후 상위 N.
+    const rankVal = (v: Pick) =>
+      oosRankBy === 'consistency' ? v.consistency : oosRankBy === 'signals' ? v.signals : v.oos;
+    const picks = [...bySymbol.entries()].sort((a, b) => rankVal(b[1]) - rankVal(a[1])).slice(0, oosMaxPick);
     if (!picks.length) {
-      oosSelectMsg = `통과(OOS 순수익 ≥ ${oosMinReturn}%) 종목이 없습니다. 임계를 낮추거나 후보를 늘려보세요.`;
+      oosSelectMsg = `설정한 기준(${criteriaSummary})을 통과한 종목이 없습니다. 기준을 완화하거나 후보를 늘려보세요.`;
       return;
     }
     watchlist.clear();
@@ -115,8 +141,18 @@
     for (const [code, v] of picks) { watchlist.add(code); map[code] = { strategy: v.strategy, tf: v.tf }; }
     symbolStrategies.replace(map);
     const preview = picks.slice(0, 6).map(([c, v]) => `${c}→${v.strategy}·${v.tf}(${v.oos.toFixed(2)}%)`).join(', ');
-    oosSelectMsg = `${picks.length}종목 선정 · 종목별 OOS 순수익 최고 전략 배정 — ${preview}${picks.length > 6 ? ' …' : ''}`;
+    oosSelectMsg = `${picks.length}종목 선정 [${criteriaSummary}] — ${preview}${picks.length > 6 ? ' …' : ''}`;
   }
+
+  // 현재 선정 기준 요약 문구 (메시지/설명에 사용).
+  const rankLabel: Record<string, string> = { return: 'OOS 순수익', consistency: '일관성', signals: '신호수' };
+  $: criteriaSummary = [
+    `순수익≥${oosMinReturn}%`,
+    oosMinSignals > 0 ? `신호≥${oosMinSignals}` : null,
+    oosMinConsistency > 0 ? `일관성≥${oosMinConsistency}%` : null,
+    oosRequireTradeable ? '강건성✓' : null,
+    `${rankLabel[oosRankBy] ?? 'OOS 순수익'}순 상위${oosMaxPick}`,
+  ].filter(Boolean).join(' · ');
 
   // 백테스트 결과를 종목(행) × 전략(열) 격자로 변환 — 각 셀은 OOS 순수익(%).
   type Row = { code: string; name: string; cells: Record<string, any>; best: string | null; bestOos: number };
@@ -253,15 +289,28 @@
   </div>
 </div>
 
-<!-- ③ OOS 순수익 기준 선정 -->
+<!-- ③ OOS 기준 선정 (선정 기준 사용자 설정) -->
 <div class="step">
-  <div class="step-head"><span class="step-no">③</span> OOS 순수익 기준 관심종목 선정 <span class="step-sub">— 종목별 베스트 전략 자동 배정</span></div>
+  <div class="step-head"><span class="step-no">③</span> 관심종목 선정 기준 설정 <span class="step-sub">— 종목별 베스트 전략 자동 배정</span></div>
   <div class="controls">
-    <div class="group"><label>최소 OOS 순수익(%)</label><input type="number" bind:value={oosMinReturn} step="0.05" /></div>
-    <div class="group"><label>최대 선정 종목수</label><input type="number" bind:value={oosMaxPick} step="1" min="1" /></div>
-    <button class="bt-btn pick" on:click={selectFromMatrix} disabled={!matrix}>★ OOS 순수익으로 선정</button>
-    <span class="bt-note">종목마다 OOS 순수익이 가장 높은(통과) 전략을 골라 관심종목으로 선정하고, 자동매매에 종목별로 다르게 적용합니다.</span>
+    <div class="group"><label>최소 OOS 순수익(%) <span class="dflt">기본 {OOS_DEFAULTS.minReturn}</span></label><input type="number" bind:value={oosMinReturn} step="0.05" placeholder={String(OOS_DEFAULTS.minReturn)} /></div>
+    <div class="group"><label>최소 OOS 신호수 <span class="dflt">기본 {OOS_DEFAULTS.minSignals}</span></label><input type="number" bind:value={oosMinSignals} step="1" min="0" placeholder={String(OOS_DEFAULTS.minSignals)} /></div>
+    <div class="group"><label>최소 일관성(%) <span class="dflt">기본 {OOS_DEFAULTS.minConsistency}</span></label><input type="number" bind:value={oosMinConsistency} step="5" min="0" max="100" placeholder={String(OOS_DEFAULTS.minConsistency)} /></div>
+    <div class="group"><label>최대 선정 종목수 <span class="dflt">기본 {OOS_DEFAULTS.maxPick}</span></label><input type="number" bind:value={oosMaxPick} step="1" min="1" placeholder={String(OOS_DEFAULTS.maxPick)} /></div>
+    <div class="group">
+      <label>랭킹 기준 <span class="dflt">기본 OOS 순수익</span></label>
+      <select bind:value={oosRankBy}>
+        <option value="return">OOS 순수익</option>
+        <option value="consistency">일관성</option>
+        <option value="signals">신호수</option>
+      </select>
+    </div>
+    <label class="chk" title="OOS 순수익>0 · 일관성≥60% · 신호≥10 을 모두 통과(✓)한 종목만 선정">
+      <input type="checkbox" bind:checked={oosRequireTradeable} /> 강건성 통과(✓)만 <span class="dflt">기본 해제</span>
+    </label>
+    <button class="bt-btn pick" on:click={selectFromMatrix} disabled={!matrix}>★ 기준으로 선정</button>
   </div>
+  <div class="bt-note">현재 기준: <b>{criteriaSummary}</b> — 종목마다 OOS 순수익 1위(거래有) 전략을 골라 위 기준으로 걸러 관심종목으로 선정하고, 자동매매에 종목별로 다르게 적용합니다.</div>
   {#if oosSelectMsg}<div class="hint added">★ {oosSelectMsg}</div>{/if}
   {#if Object.keys($symbolStrategies).length}
     <div class="bt-assign">배정됨:
@@ -333,12 +382,12 @@
 
 <style>
   header h1 { margin: 0 0 4px; font-size: 22px; }
-  .sub { color: #6c7086; margin: 0 0 16px; font-size: 13px; }
+  .sub { color: #a6adc8; margin: 0 0 16px; font-size: 13px; }
   .sub code { background: #313244; padding: 1px 5px; border-radius: 4px; color: #bac2de; }
   .picker-wrap { margin-bottom: 14px; }
   .controls { display: flex; gap: 16px; align-items: flex-end; margin-bottom: 16px; flex-wrap: wrap; }
   .group { display: flex; flex-direction: column; gap: 6px; }
-  label { font-size: 12px; color: #9399b2; }
+  label { font-size: 12px; color: #bac2de; }
   select, input[type='number'] { background: #1e1e2e; color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px; padding: 5px 8px; width: 110px; }
   .refresh { background: #89b4fa; color: #1e1e2e; border: none; border-radius: 6px; padding: 8px 16px; font-weight: 600; cursor: pointer; }
   .hint { font-size: 13px; color: #f9e2af; background: #1f1d2e; border: 1px solid #45475a; border-radius: 6px; padding: 8px 12px; margin: 10px 0 0; }
@@ -346,52 +395,55 @@
   .step { background: #181825; border: 1px solid #313244; border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; }
   .step-head { font-size: 14px; color: #cdd6f4; margin-bottom: 10px; }
   .step-no { color: #89b4fa; font-weight: 700; }
-  .step-sub { color: #6c7086; font-size: 12px; font-weight: 400; }
+  .step-sub { color: #a6adc8; font-size: 12px; font-weight: 400; }
   .step .controls { margin-bottom: 0; }
   .cand-count { font-size: 13px; color: #cdd6f4; align-self: center; }
   .cand-count b { color: #a6e3a1; }
   .bt-btn { background: #cba6f7; color: #1e1e2e; border: none; border-radius: 6px; padding: 8px 16px; font-weight: 600; cursor: pointer; }
   .bt-btn.pick { background: #a6e3a1; }
   .bt-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  .bt-note { font-size: 12px; color: #6c7086; flex: 1; min-width: 240px; line-height: 1.5; }
-  .bt-assign { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; font-size: 12px; color: #9399b2; }
+  .chk { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #cdd6f4; align-self: center; cursor: pointer; white-space: nowrap; }
+  .chk input { width: auto; }
+  .dflt { color: #a6adc8; font-size: 11px; font-weight: 400; }
+  .bt-note { font-size: 12px; color: #a6adc8; flex: 1; min-width: 240px; line-height: 1.5; }
+  .bt-assign { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; font-size: 12px; color: #bac2de; }
   .assign-chip { background: #1e1e2e; border: 1px solid #313244; border-radius: 10px; padding: 2px 8px; }
   .assign-chip b { color: #cba6f7; }
-  .assign-chip em { color: #6c7086; font-style: normal; font-size: 11px; margin-left: 4px; }
+  .assign-chip em { color: #a6adc8; font-style: normal; font-size: 11px; margin-left: 4px; }
   .reflect { margin-top: 10px; font-size: 12px; padding: 8px 12px; border-radius: 6px; border: 1px solid #45475a; }
   .reflect a { color: inherit; text-decoration: underline; }
-  .reflect.off { color: #9399b2; background: #1e1e2e; }
+  .reflect.off { color: #bac2de; background: #1e1e2e; }
   .reflect.ok { color: #a6e3a1; background: #1a2a1a; border-color: #3a4a3a; }
   .reflect.warn { color: #f9e2af; background: #2a2717; border-color: #4a4530; }
   .to-trading { margin-left: auto; color: #a6e3a1; text-decoration: none; font-size: 13px; align-self: center; }
   .panel { background: #181825; border-radius: 10px; padding: 12px 16px; margin-top: 4px; }
-  .panel.empty { color: #9399b2; font-size: 13px; }
+  .panel.empty { color: #bac2de; font-size: 13px; }
   .panel h3 { margin: 0 0 6px; font-size: 15px; }
-  .legend { color: #6c7086; font-size: 12px; margin: 0 0 12px; }
+  .legend { color: #a6adc8; font-size: 12px; margin: 0 0 12px; }
   .error { background: #f38ba8; color: #1e1e2e; padding: 10px; border-radius: 6px; margin-bottom: 12px; font-size: 13px; }
   /* 종목 × 전략 OOS 격자 */
   .grid-wrap { overflow-x: auto; }
   table.grid { width: 100%; border-collapse: collapse; font-size: 12px; }
-  table.grid th { text-align: right; padding: 6px 8px; color: #9399b2; border-bottom: 1px solid #313244; font-weight: 500; white-space: nowrap; }
+  table.grid th { text-align: right; padding: 6px 8px; color: #bac2de; border-bottom: 1px solid #313244; font-weight: 500; white-space: nowrap; }
   table.grid th:first-child { text-align: left; }
   table.grid td { padding: 6px 8px; border-bottom: 1px solid #232334; text-align: right; font-variant-numeric: tabular-nums; }
   table.grid td:first-child { text-align: left; }
-  .th-tf { display: block; font-size: 10px; color: #6c7086; font-weight: 400; }
+  .th-tf { display: block; font-size: 10px; color: #a6adc8; font-weight: 400; }
   .sticky { position: sticky; left: 0; background: #181825; z-index: 1; }
   tr.watched .sticky { background: #1a1a2a; }
-  .code { color: #6c7086; margin-left: 6px; font-size: 11px; }
+  .code { color: #a6adc8; margin-left: 6px; font-size: 11px; }
   .cell .bestcell { font-weight: 700; background: #1d2a1d; padding: 1px 5px; border-radius: 4px; }
   .na { color: #45475a; }
   .pos { color: #a6e3a1; } .neg { color: #f38ba8; }
   .tick { color: #a6e3a1; }
-  .star { background: none; border: none; cursor: pointer; font-size: 15px; color: #6c7086; padding: 0; }
+  .star { background: none; border: none; cursor: pointer; font-size: 15px; color: #a6adc8; padding: 0; }
   .star.on { color: #f9e2af; }
 
   /* eBest API 패널 */
   .api-panel { background: #181825; border: 1px solid #313244; border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; }
   .api-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
   .api-title { display: flex; align-items: center; gap: 8px; font-size: 14px; flex-wrap: wrap; }
-  .toggle { background: none; border: none; color: #9399b2; cursor: pointer; font-size: 13px; padding: 0; }
+  .toggle { background: none; border: none; color: #bac2de; cursor: pointer; font-size: 13px; padding: 0; }
   .badge { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 10px; }
   .badge.mock { background: #f9e2af; color: #1e1e2e; }
   .badge.live { background: #a6e3a1; color: #1e1e2e; }
@@ -406,13 +458,13 @@
   .rsum.ok { color: #a6e3a1; }
   .rsum.fail { color: #f38ba8; }
   .api-result table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  .api-result th { text-align: left; padding: 5px 7px; color: #9399b2; border-bottom: 1px solid #313244; font-weight: 500; }
+  .api-result th { text-align: left; padding: 5px 7px; color: #bac2de; border-bottom: 1px solid #313244; font-weight: 500; }
   .api-result td { padding: 5px 7px; border-bottom: 1px solid #232334; }
   .api-result td.ok { color: #a6e3a1; }
   .api-result td.fail { color: #f38ba8; }
-  .api-result td.tr { color: #6c7086; font-family: monospace; }
+  .api-result td.tr { color: #a6adc8; font-family: monospace; }
   .api-result td.num { text-align: right; font-variant-numeric: tabular-nums; }
   .api-result td.detail { color: #bac2de; }
-  .api-hint { font-size: 12px; color: #6c7086; margin: 10px 0 0; }
+  .api-hint { font-size: 12px; color: #a6adc8; margin: 10px 0 0; }
   .api-hint code { background: #313244; padding: 1px 5px; border-radius: 4px; color: #bac2de; }
 </style>

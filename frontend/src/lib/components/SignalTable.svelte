@@ -47,11 +47,11 @@
 
 <style>
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { text-align: left; padding: 8px; color: #9399b2; border-bottom: 1px solid #313244; font-weight: 500; }
+  th { text-align: left; padding: 8px; color: #bac2de; border-bottom: 1px solid #313244; font-weight: 500; }
   td { padding: 8px; border-bottom: 1px solid #232334; color: #cdd6f4; }
   tr.watched { background: #1a1a2a; }
   .num { text-align: right; font-variant-numeric: tabular-nums; }
-  .code { color: #6c7086; margin-left: 6px; font-size: 11px; }
+  .code { color: #a6adc8; margin-left: 6px; font-size: 11px; }
   .up { color: #ef4444; }
   .down { color: #3b82f6; }
   .bullish { color: #ef4444; }
@@ -59,9 +59,9 @@
   .score { padding: 2px 6px; border-radius: 4px; background: #313244; }
   .score.hi { background: #a6e3a1; color: #1e1e2e; font-weight: 700; }
   .conf .b { font-size: 10px; background: #313244; padding: 1px 5px; border-radius: 8px; margin-right: 3px; }
-  .ref { opacity: 0.65; font-style: italic; }
-  .empty { text-align: center; color: #6c7086; padding: 24px; }
-  .star { background: none; border: none; cursor: pointer; font-size: 16px; color: #6c7086; padding: 0; }
+  .ref { opacity: 0.85; font-style: italic; }
+  .empty { text-align: center; color: #a6adc8; padding: 24px; }
+  .star { background: none; border: none; cursor: pointer; font-size: 16px; color: #a6adc8; padding: 0; }
   .star.on { color: #f9e2af; }
   a { color: #89b4fa; text-decoration: none; }
 </style>

@@ -48,14 +48,14 @@
   .title { font-weight: 700; font-size: 15px; }
   .badge { font-size: 12px; padding: 3px 10px; border-radius: 12px; background: #f38ba8; color: #1e1e2e; font-weight: 700; }
   .badge.on { background: #a6e3a1; }
-  .desc { font-size: 12px; color: #9399b2; margin: 8px 0 12px; }
+  .desc { font-size: 12px; color: #bac2de; margin: 8px 0 12px; }
   ul { list-style: none; padding: 0; margin: 0; }
   li { display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: 13px; color: #bac2de; border-bottom: 1px solid #232334; }
   li.pass { color: #cdd6f4; }
-  .ic { width: 18px; color: #6c7086; }
+  .ic { width: 18px; color: #a6adc8; }
   li.pass .ic { color: #a6e3a1; }
   .lbl { flex: 1; }
   .val { font-variant-numeric: tabular-nums; }
-  .req { color: #6c7086; font-size: 11px; }
-  .stats { margin-top: 12px; font-size: 11px; color: #6c7086; }
+  .req { color: #a6adc8; font-size: 11px; }
+  .stats { margin-top: 12px; font-size: 11px; color: #a6adc8; }
 </style>

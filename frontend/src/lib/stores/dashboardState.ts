@@ -18,8 +18,12 @@ export interface DashboardState {
   btTf: string;
   btHold: number;
   matrix: any;
-  // 스텝 ③ OOS 선정
+  // 스텝 ③ OOS 선정 기준
   oosMinReturn: number;
+  oosMinSignals: number;
+  oosMinConsistency: number;
+  oosRequireTradeable: boolean;
+  oosRankBy: string;
   oosMaxPick: number;
   oosSelectMsg: string;
   // eBest 패널

@@ -1,8 +1,7 @@
 //! Pattern detection endpoints (single symbol, multi-scan, optional MTF).
 
-use crate::indicators::ema_values;
 use crate::mtf::MtfEngine;
-use crate::pattern::{apply_strategy, detect_setups, ALL_PATTERNS, SETUP_PATTERNS};
+use crate::pattern::{apply_strategy, detect_setups, SetupSeries, ALL_PATTERNS, SETUP_PATTERNS};
 use crate::session::SessionContext;
 use crate::state::AppState;
 use crate::strategy::{self};
@@ -52,12 +51,11 @@ async fn get_patterns(State(st): State<AppState>, Path(shcode): Path<String>, Qu
             apply_strategy(r, &cfg, true, false, false);
         }
     }
-    // Merge context setups (VWAP / ORB / EMA pullback) for the latest closed bar.
+    // Merge context setups (VWAP / ORB / EMA / RSI / BB) for the latest closed bar.
     if candles.len() >= 3 {
         let ctx = SessionContext::for_tf(&candles, tf);
-        let ema9 = ema_values(&candles, 9);
-        let ema20 = ema_values(&candles, 20);
-        let mut setups = detect_setups(&candles, candles.len() - 1, &ctx, &ema9, &ema20, &cfg.enabled_patterns, cfg.allows_short());
+        let series = SetupSeries::compute(&candles);
+        let mut setups = detect_setups(&candles, candles.len() - 1, &ctx, &series, &cfg.enabled_patterns, cfg.allows_short());
         for s in &mut setups {
             apply_strategy(s, &cfg, false, false, false);
         }

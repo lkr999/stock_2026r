@@ -49,9 +49,9 @@
   .run-badge {
     display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 600;
     padding: 5px 12px; border-radius: 12px; text-decoration: none; white-space: nowrap;
-    background: #313244; color: #9399b2; border: 1px solid #45475a;
+    background: #313244; color: #bac2de; border: 1px solid #45475a;
   }
-  .run-badge .dot { width: 8px; height: 8px; border-radius: 50%; background: #6c7086; }
+  .run-badge .dot { width: 8px; height: 8px; border-radius: 50%; background: #a6adc8; }
   .run-badge.paper { color: #a6e3a1; border-color: #3a4a3a; }
   .run-badge.paper .dot { background: #a6e3a1; box-shadow: 0 0 6px #a6e3a1; }
   .run-badge.live { color: #f38ba8; border-color: #4a2f36; }

@@ -2,8 +2,7 @@
 
 use crate::broker::shorting_supported;
 use crate::candle::Candle;
-use crate::indicators::ema_values;
-use crate::pattern::{apply_strategy, compute_atr, detect_setups, PatternDetector, PatternResult};
+use crate::pattern::{apply_strategy, compute_atr, detect_setups, PatternDetector, PatternResult, SetupSeries};
 use crate::risk::RiskConfig;
 use crate::session::SessionContext;
 use crate::strategy::StrategyConfig;
@@ -146,10 +145,9 @@ pub fn run_strategy_backtest(
     let rt_cost = cost.round_trip_cost() * 100.0;
     let cost_pct = rt_cost;
     let n = candles.len();
-    // Session-anchored context for VWAP/ORB/EMA setups, precomputed once.
+    // Session-anchored context for VWAP/ORB/EMA/RSI/BB setups, precomputed once.
     let ctx = SessionContext::for_tf(candles, tf);
-    let ema9 = ema_values(candles, 9);
-    let ema20 = ema_values(candles, 20);
+    let series = SetupSeries::compute(candles);
     let mut returns: Vec<f64> = vec![];
     let mut rr_values: Vec<f64> = vec![];
     let mut i = 0;
@@ -164,7 +162,7 @@ pub fn run_strategy_backtest(
         // backtest (and the OOS "tradeable" gate it feeds) would credit a
         // strategy for trades the engine can never place in paper or live.
         let short_ok = cfg.allows_short() && shorting_supported();
-        let mut setups = detect_setups(candles, i, &ctx, &ema9, &ema20, &cfg.enabled_patterns, short_ok);
+        let mut setups = detect_setups(candles, i, &ctx, &series, &cfg.enabled_patterns, short_ok);
         for s in &mut setups {
             apply_strategy(s, cfg, false, false, false);
         }
@@ -185,8 +183,35 @@ pub fn run_strategy_backtest(
             continue;
         };
         let is_short = top.pattern_type == "bearish";
-        let entry = candles[i + 1].open;
-        let atr = compute_atr(&candles[..=i], 14);
+        // 확인봉 게이트 — 엔진(try_enter)과 동일: 패턴 후 `confirm_window_bars`
+        // 봉 안에 확인봉(패턴 고점 돌파 or 방향 일치 종가)이 나와야 그 *다음*
+        // 봉 시가에 진입한다. 미확인 시 진입 없음. 이 게이트를 빼면 확인봉 ON
+        // 상태의 실거래와 OOS 통계가 어긋난다.
+        let mut entry_idx = i + 1;
+        if risk.require_confirmation {
+            let p_high = top.candles_used.iter().map(|c| c.high).fold(f64::MIN, f64::max);
+            let p_low = top.candles_used.iter().map(|c| c.low).fold(f64::MAX, f64::min);
+            let p_close = top.candles_used.last().map(|c| c.close).unwrap_or(0.0);
+            let win = risk.confirm_window_bars.max(1) as usize;
+            let hi = (i + win).min(n.saturating_sub(2)); // 확인봉 다음 봉에 진입해야 하므로 n-2까지
+            let confirmed = (i + 1..=hi).find(|&j| {
+                let b = &candles[j];
+                if is_short {
+                    b.close < p_low || (b.is_bear() && b.close < p_close)
+                } else {
+                    b.close > p_high || (b.is_bull() && b.close > p_close)
+                }
+            });
+            match confirmed {
+                Some(j) => entry_idx = j + 1,
+                None => {
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+        let entry = candles[entry_idx].open;
+        let atr = compute_atr(&candles[..entry_idx], 14);
         if entry <= 0.0 || atr <= 0.0 {
             i += 1;
             continue;
@@ -217,13 +242,19 @@ pub fn run_strategy_backtest(
         };
         rr_values.push(rr);
         let mut peak = entry; // best excursion: high for longs, low for shorts
-        let last_idx = (i + 1 + max_hold_bars).min(n - 1);
+        let last_idx = (entry_idx + max_hold_bars).min(n - 1);
         let (mut exit_price, mut exit_idx) = (candles[last_idx].close, last_idx);
-        for j in (i + 1)..(i + 1 + max_hold_bars).min(n) {
+        for j in entry_idx..(entry_idx + max_hold_bars).min(n) {
             let c = candles[j].close;
+            // 트레일링 폭은 엔진(check_exit)과 동일하게 *현재 봉 기준* ATR 로
+            // 매 봉 재계산한다 (손절/익절선은 진입 시점 기준으로 고정).
+            let atr_j = {
+                let a = compute_atr(&candles[..=j], 14);
+                if a > 0.0 { a } else { atr }
+            };
             if is_short {
                 peak = peak.min(c);
-                let trail = peak + atr * risk.trailing_stop_atr;
+                let trail = peak + atr_j * risk.trailing_stop_atr;
                 if c >= stop {
                     exit_price = stop;
                     exit_idx = j;
@@ -241,7 +272,7 @@ pub fn run_strategy_backtest(
                 }
             } else {
                 peak = peak.max(c);
-                let trail = peak - atr * risk.trailing_stop_atr;
+                let trail = peak - atr_j * risk.trailing_stop_atr;
                 if c <= stop {
                     exit_price = stop;
                     exit_idx = j;

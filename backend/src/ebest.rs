@@ -248,4 +248,41 @@ impl EBestService {
         }});
         self.post_tr_retry(token, "stock/accno", "t0424", &body).await
     }
+
+    /// t0425 — 당일 주문 체결/미체결 조회. `ordno` 주문의
+    /// `(체결수량, 평균체결가, 미체결잔량)` 을 돌려준다 (조회 실패 시 None).
+    /// 지정가 주문의 체결 대사(fill reconciliation)에 사용한다.
+    pub async fn order_fill_status(&self, token: &str, code: &str, ordno: i64) -> Option<(i64, f64, i64)> {
+        let expcode = if code.starts_with('A') { code.to_string() } else { format!("A{code}") };
+        let body = json!({"t0425InBlock": {
+            "expcode": expcode, "chegb": "0", "medosu": "0", "sortgb": "1", "cts_ordno": " ",
+        }});
+        let res = self.post_tr_retry(token, "stock/accno", "t0425", &body).await;
+        let rows = res.get("t0425OutBlock1").and_then(Value::as_array)?;
+        for r in rows {
+            let row_ordno = r.get("ordno").and_then(parse_float).unwrap_or(-1.0) as i64;
+            if row_ordno != ordno {
+                continue;
+            }
+            let cheqty = r.get("cheqty").and_then(parse_float).unwrap_or(0.0) as i64;
+            let cheprice = r.get("cheprice").and_then(parse_float).unwrap_or(0.0);
+            let ordrem = r.get("ordrem").and_then(parse_float).unwrap_or(0.0) as i64;
+            return Some((cheqty, cheprice, ordrem));
+        }
+        None
+    }
+
+    /// CSPAT00801 — 취소주문 (지정가 미체결 잔량 취소). 성공 여부를 돌려준다.
+    pub async fn cancel_order(&self, token: &str, ordno: i64, code: &str, qty: i64) -> bool {
+        let isu_no = if code.starts_with('A') { code.to_string() } else { format!("A{code}") };
+        let body = json!({"CSPAT00801InBlock1": {
+            "OrgOrdNo": ordno, "IsuNo": isu_no, "OrdQty": qty,
+        }});
+        let res = self.post_tr_retry(token, "stock/order", "CSPAT00801", &body).await;
+        let ok = res.get("rsp_cd").and_then(Value::as_str) == Some("0000");
+        if !ok {
+            tracing::warn!("[EBest] cancel_order {ordno} ({code}) failed: {:?}", res.get("rsp_msg"));
+        }
+        ok
+    }
 }

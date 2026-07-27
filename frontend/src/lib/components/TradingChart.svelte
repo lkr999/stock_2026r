@@ -199,7 +199,7 @@
     return {
       width: el.clientWidth,
       height: h,
-      layout: { background: { type: ColorType.Solid, color: '#181825' }, textColor: '#9399b2', fontSize: 10 },
+      layout: { background: { type: ColorType.Solid, color: '#181825' }, textColor: '#bac2de', fontSize: 10 },
       grid: { vertLines: { color: 'rgba(49,50,68,0.3)' }, horzLines: { color: 'rgba(49,50,68,0.3)' } },
       crosshair: { mode: CrosshairMode.Normal },
       rightPriceScale: { borderColor: '#313244' },
@@ -370,16 +370,16 @@
     padding: 1px 5px; border-radius: 3px; white-space: nowrap;
   }
   .legend { display: flex; gap: 10px; font-size: 10px; padding: 2px 4px; flex-wrap: wrap; }
-  .plabel { font-size: 10px; color: #6c7086; padding: 4px 4px 0; }
+  .plabel { font-size: 10px; color: #a6adc8; padding: 4px 4px 0; }
   .tip {
     position: absolute; z-index: 10; pointer-events: none;
     background: rgba(17,17,27,0.95); border: 1px solid #45475a; border-radius: 6px;
     padding: 7px 9px; font-size: 11px; color: #cdd6f4; min-width: 150px;
     box-shadow: 0 4px 14px rgba(0,0,0,0.5);
   }
-  .tt-time { color: #9399b2; font-size: 10px; margin-bottom: 4px; }
+  .tt-time { color: #bac2de; font-size: 10px; margin-bottom: 4px; }
   .tt-grid { display: grid; grid-template-columns: auto 1fr; gap: 1px 8px; font-variant-numeric: tabular-nums; }
-  .tt-grid span { color: #6c7086; }
+  .tt-grid span { color: #a6adc8; }
   .tt-grid b { text-align: right; }
   .tt-ind { margin-top: 5px; display: flex; flex-direction: column; gap: 1px; font-size: 10px; font-variant-numeric: tabular-nums; }
   .tt-trades { margin-top: 6px; padding-top: 5px; border-top: 1px solid #313244; display: flex; flex-direction: column; gap: 4px; }
@@ -388,7 +388,7 @@
   .tt-side.buy { color: #a6e3a1; }
   .tt-side.sell { color: #f38ba8; }
   .tt-qty { color: #cdd6f4; }
-  .tt-reason { color: #6c7086; font-size: 9px; }
+  .tt-reason { color: #a6adc8; font-size: 9px; }
   .up { color: #ef4444; }
   .down { color: #3b82f6; }
 </style>

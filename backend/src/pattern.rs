@@ -65,9 +65,10 @@ pub const ALL_PATTERNS: [&str; 16] = [
     "marubozu_bear",
 ];
 
-/// Context-aware day-trading setup names (VWAP / ORB / EMA pullback).
+/// Context-aware day-trading setup names (VWAP / ORB / EMA pullback / RSI
+/// mean-reversion / Bollinger squeeze breakout).
 /// These are detected by [`detect_setups`], not the windowed [`PatternDetector`].
-pub const SETUP_PATTERNS: [&str; 8] = [
+pub const SETUP_PATTERNS: [&str; 12] = [
     "vwap_reclaim",
     "vwap_loss",
     "vwap_bounce",
@@ -76,6 +77,10 @@ pub const SETUP_PATTERNS: [&str; 8] = [
     "orb_breakdown",
     "ema_pullback_long",
     "ema_pullback_short",
+    "rsi_oversold_bounce",
+    "rsi_overbought_drop",
+    "bb_squeeze_break_up",
+    "bb_squeeze_break_down",
 ];
 
 /// Least-squares slope of the closing prices (trend direction).
@@ -484,10 +489,38 @@ fn avg_volume(candles: &[Candle], i: usize, lookback: usize) -> f64 {
     candles[i - lookback..i].iter().map(|c| c.volume).sum::<f64>() / lookback as f64
 }
 
-/// Detect context-aware day-trading setups (VWAP / ORB / EMA pullback) on the
-/// closed bar `i`. Unlike the windowed [`PatternDetector`], these need the full
-/// session history, supplied via the precomputed [`SessionContext`] and raw EMA
-/// arrays (`NaN` warmup) so VWAP/opening-range anchors stay correct.
+/// Precomputed indicator arrays the context setups read (`NaN` = warmup).
+/// Built once per scan via [`SetupSeries::compute`] so the per-bar setup checks
+/// stay O(1) — the engine and the backtester share the exact same inputs.
+pub struct SetupSeries {
+    pub ema9: Vec<f64>,
+    pub ema20: Vec<f64>,
+    pub rsi14: Vec<f64>,
+    pub bb_upper: Vec<f64>,
+    pub bb_lower: Vec<f64>,
+    /// Relative band width (upper−lower)/mid — the squeeze measure.
+    pub bb_width: Vec<f64>,
+}
+
+impl SetupSeries {
+    pub fn compute(candles: &[Candle]) -> Self {
+        let (bb_upper, bb_lower, bb_width) = crate::indicators::bollinger_values(candles, 20, 2.0);
+        Self {
+            ema9: crate::indicators::ema_values(candles, 9),
+            ema20: crate::indicators::ema_values(candles, 20),
+            rsi14: crate::indicators::rsi_values(candles, 14),
+            bb_upper,
+            bb_lower,
+            bb_width,
+        }
+    }
+}
+
+/// Detect context-aware day-trading setups (VWAP / ORB / EMA pullback / RSI
+/// mean-reversion / Bollinger squeeze) on the closed bar `i`. Unlike the
+/// windowed [`PatternDetector`], these need the full session history, supplied
+/// via the precomputed [`SessionContext`] and [`SetupSeries`] (`NaN` warmup) so
+/// VWAP/opening-range anchors stay correct.
 ///
 /// Each result carries its own ATR/volume confirmation flags so the caller can
 /// run the same composite scoring and entry gates as the reversal patterns.
@@ -496,8 +529,7 @@ pub fn detect_setups(
     candles: &[Candle],
     i: usize,
     ctx: &SessionContext,
-    ema9: &[f64],
-    ema20: &[f64],
+    series: &SetupSeries,
     enabled: &[String],
     allow_short: bool,
 ) -> Vec<PatternResult> {
@@ -562,13 +594,51 @@ pub fn detect_setups(
     }
 
     // EMA pullback continuation — trend-aligned dip that resumes.
-    let (e9, e20) = (ema9[i], ema20[i]);
+    let (e9, e20) = (series.ema9[i], series.ema20[i]);
     if e9.is_finite() && e20.is_finite() {
         if want("ema_pullback_long") && e9 > e20 && c.low <= e9 * 1.002 && c.close > e9 && c.is_bull() {
             out.push(build("ema_pullback_long", "bullish", 0.55 + c.body_ratio() * 0.35, vec![c.clone()]));
         }
         if allow_short && want("ema_pullback_short") && e9 < e20 && c.high >= e9 * 0.998 && c.close < e9 && c.is_bear() {
             out.push(build("ema_pullback_short", "bearish", 0.55 + c.body_ratio() * 0.35, vec![c.clone()]));
+        }
+    }
+
+    // RSI mean-reversion — RSI(14) leaves the oversold/overbought zone with a
+    // confirming bar (Connors-style; historically among the highest win-rate
+    // intraday setups because it buys exhaustion instead of chasing).
+    let (rsi_prev, rsi_now) = (series.rsi14[i - 1], series.rsi14[i]);
+    if rsi_prev.is_finite() && rsi_now.is_finite() {
+        if want("rsi_oversold_bounce") && rsi_prev <= 30.0 && rsi_now > rsi_prev && c.is_bull() {
+            // Deeper oversold → stronger snap-back expectancy.
+            let depth = ((30.0 - rsi_prev) / 30.0).clamp(0.0, 1.0);
+            let conf = 0.5 + depth * 0.2 + c.body_ratio() * 0.15 + if vol_spike { 0.15 } else { 0.0 };
+            out.push(build("rsi_oversold_bounce", "bullish", conf, vec![p.clone(), c.clone()]));
+        }
+        if allow_short && want("rsi_overbought_drop") && rsi_prev >= 70.0 && rsi_now < rsi_prev && c.is_bear() {
+            let depth = ((rsi_prev - 70.0) / 30.0).clamp(0.0, 1.0);
+            let conf = 0.5 + depth * 0.2 + c.body_ratio() * 0.15 + if vol_spike { 0.15 } else { 0.0 };
+            out.push(build("rsi_overbought_drop", "bearish", conf, vec![p.clone(), c.clone()]));
+        }
+    }
+
+    // Bollinger squeeze breakout — volatility contraction (band width near its
+    // 20-bar low) resolving with a close outside the band. Squeezes precede
+    // expansions; entering on the break rides the new impulse early.
+    let (bb_u, bb_l, bw) = (series.bb_upper[i], series.bb_lower[i], series.bb_width[i - 1]);
+    if bb_u.is_finite() && bb_l.is_finite() && bw.is_finite() && i >= 21 {
+        let lookback = &series.bb_width[i.saturating_sub(20)..i];
+        let min_w = lookback.iter().copied().filter(|w| w.is_finite()).fold(f64::INFINITY, f64::min);
+        let squeezed = min_w.is_finite() && bw <= min_w * 1.10; // was at/near the tightest width
+        if squeezed {
+            if want("bb_squeeze_break_up") && c.close > bb_u && c.is_bull() {
+                let conf = 0.55 + if vol_spike { 0.25 } else { 0.0 } + c.body_ratio() * 0.2;
+                out.push(build("bb_squeeze_break_up", "bullish", conf, vec![c.clone()]));
+            }
+            if allow_short && want("bb_squeeze_break_down") && c.close < bb_l && c.is_bear() {
+                let conf = 0.55 + if vol_spike { 0.25 } else { 0.0 } + c.body_ratio() * 0.2;
+                out.push(build("bb_squeeze_break_down", "bearish", conf, vec![c.clone()]));
+            }
         }
     }
     out

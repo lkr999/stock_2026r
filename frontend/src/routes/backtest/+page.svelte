@@ -210,7 +210,7 @@
 
 <style>
   h1 { font-size: 22px; margin: 0 0 6px; }
-  .sub { color: #6c7086; font-size: 13px; margin: 0 0 16px; }
+  .sub { color: #a6adc8; font-size: 13px; margin: 0 0 16px; }
   .help { background: #181825; border-radius: 10px; margin-bottom: 16px; }
   .help-toggle { background: none; border: none; color: #89b4fa; font-size: 13px; font-weight: 600; cursor: pointer; padding: 12px 16px; width: 100%; text-align: left; }
   .help-body { padding: 0 18px 16px; color: #bac2de; font-size: 13px; line-height: 1.6; }
@@ -221,7 +221,7 @@
   .controls { display: flex; gap: 16px; align-items: flex-end; margin-bottom: 16px; flex-wrap: wrap; }
   .group { display: flex; flex-direction: column; gap: 6px; }
   .group.inline { flex-direction: row; align-items: center; gap: 8px; }
-  label { font-size: 12px; color: #9399b2; }
+  label { font-size: 12px; color: #bac2de; }
   select { background: #1e1e2e; color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px; padding: 6px 8px; }
   button { background: #89b4fa; color: #1e1e2e; border: none; border-radius: 6px; padding: 8px 18px; font-weight: 600; cursor: pointer; }
   button.alt { background: #cba6f7; }
@@ -229,10 +229,10 @@
   button.apply { background: #a6e3a1; margin-top: 10px; }
   button.apply.sm { padding: 3px 12px; font-size: 12px; margin: 0; }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
-  .cd { color: #6c7086; font-size: 11px; }
+  .cd { color: #a6adc8; font-size: 11px; }
   .note { color: #f9e2af; font-size: 11px; }
-  tr.dim td { color: #6c7086; }
-  tr.dim td strong { color: #9399b2; }
+  tr.dim td { color: #a6adc8; }
+  tr.dim td strong { color: #bac2de; }
   tr.winner td { background: #1d2a1d; }
   .best { background: linear-gradient(90deg, #1d2a1d, #181825); border: 1px solid #2a3a2a; border-radius: 10px; padding: 14px 18px; margin-bottom: 16px; }
   .best-head { font-size: 16px; margin-bottom: 6px; }
@@ -242,13 +242,13 @@
   .panel-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
   .panel-head h3 { margin: 0; }
   h3 { margin: 0 0 14px; font-size: 15px; }
-  h4 { color: #9399b2; }
+  h4 { color: #bac2de; }
   .metrics { display: flex; gap: 28px; margin-bottom: 16px; flex-wrap: wrap; }
   .metrics div { display: flex; flex-direction: column; gap: 4px; }
-  .metrics span { font-size: 12px; color: #9399b2; }
+  .metrics span { font-size: 12px; color: #bac2de; }
   .metrics strong { font-size: 20px; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { text-align: left; padding: 7px; color: #9399b2; border-bottom: 1px solid #313244; font-weight: 500; }
+  th { text-align: left; padding: 7px; color: #bac2de; border-bottom: 1px solid #313244; font-weight: 500; }
   td { padding: 7px; border-bottom: 1px solid #232334; }
   .pos { color: #a6e3a1; } .neg { color: #f38ba8; }
   .badge { font-size: 11px; padding: 1px 7px; border-radius: 10px; font-weight: 600; }
