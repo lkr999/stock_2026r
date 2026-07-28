@@ -49,6 +49,18 @@ async fn main() {
     let cors = build_cors(&settings.cors_origins);
     let st = AppState::new(settings);
 
+    // 백엔드 재시작 시 자동매매 자동 재개: 직전 실행 설정이 저장돼 있고 사용자가
+    // 명시적으로 정지하지 않았다면 엔진을 되살린다. 이것이 없으면 재시작 후
+    // 스냅샷의 보유 포지션이 관리 공백(손절/EOD 청산 누락) 상태로 방치된다.
+    {
+        let st_boot = st.clone();
+        tokio::spawn(async move {
+            // eBest 토큰/네트워크 초기화 여유를 잠깐 두고 재개한다.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            routers::trading::autostart_from_disk(st_boot).await;
+        });
+    }
+
     // 자동 전송은 "보유 포지션 수 변동" 시에만. 나머지(주기/시작·정지 등)는
     // 수동(/chk 명령·웹 버튼)으로만 받는다.
     spawn_position_watcher(st.clone());
@@ -179,6 +191,7 @@ async fn handle_telegram_command(st: &AppState, cmd: telegram::Command) -> Strin
                         // 기존 설정/포지션/현금을 유지한 채 재개(resume=true).
                         let poll = e.status().await.get("poll_sec").and_then(serde_json::Value::as_u64).unwrap_or(60);
                         e.start(poll, true).await;
+                        routers::trading::set_autostart_enabled(true);
                         format!("▶️ 자동매매 시작\n\n{}", telegram::status_section(&e.status().await))
                     }
                 }
@@ -190,6 +203,8 @@ async fn handle_telegram_command(st: &AppState, cmd: telegram::Command) -> Strin
                 None => "ℹ️ 실행 중인 엔진이 없습니다.".into(),
                 Some(e) => {
                     e.stop().await;
+                    // 사용자가 의도적으로 정지 — 재부팅 시 자동 재개하지 않는다.
+                    routers::trading::set_autostart_enabled(false);
                     format!("⏹ 자동매매 중지\n\n{}", telegram::status_section(&e.status().await))
                 }
             }

@@ -152,6 +152,10 @@ struct State {
     last_exit_price: HashMap<String, (f64, i64)>,
     bars_held: HashMap<String, i64>,
     current_prices: HashMap<String, f64>,
+    /// 전일(이월) 스냅샷에서 복원된 포지션 — 엔진이 꺼진 동안 EOD 청산을 놓친
+    /// 것이므로 `eod_flatten` 이 켜져 있으면 첫 사이클에 즉시 청산한다.
+    /// (같은 날 재시작 복원은 해당 없음 — 정상 관리 계속.)
+    flatten_stale: HashSet<String>,
     /// Codes with a close order in flight — blocks a second concurrent close
     /// (manual vs automatic) from double-selling the same position.
     closing: HashSet<String>,
@@ -354,6 +358,7 @@ impl TradingEngine {
             last_exit_price: HashMap::new(),
             bars_held: HashMap::new(),
             current_prices: HashMap::new(),
+            flatten_stale: HashSet::new(),
             closing: HashSet::new(),
             loss_limit_notified: false,
             unmanaged_holdings: vec![],
@@ -397,6 +402,16 @@ impl TradingEngine {
             // 의미가 없고(주말·휴일을 건너뛴 봉 계산이 불확정), 새로 평가한다.
             s.cooldown.clear();
             s.last_exit_price.clear();
+            // 전일 이월 포지션: 엔진이 꺼져 있어 EOD 청산(15:10)을 놓친 것.
+            // 단타 설계상 밤새 갭 리스크에 노출된 상태이므로 표시해 두고,
+            // `eod_flatten` 이 켜져 있으면 첫 사이클에 즉시 청산한다.
+            s.flatten_stale = s.risk.open_positions().keys().cloned().collect();
+            if !s.flatten_stale.is_empty() {
+                tracing::warn!(
+                    "[engine] 전일({}) 이월 포지션 {}건 복원 — eod_flatten 설정 시 장 시작 후 즉시 청산: {:?}",
+                    snap.day, s.flatten_stale.len(), s.flatten_stale
+                );
+            }
         }
         tracing::info!("[engine] snapshot restored ({} mode, {n} positions, cash={:.0})", self.mode.as_str(), s.cash);
         true
@@ -981,6 +996,29 @@ async fn scan_and_trade(deps: &Deps, state: &Arc<Mutex<State>>, token: &str) -> 
             continue;
         }
 
+        // 전일 이월 포지션(엔진 미가동으로 EOD 청산을 놓친 것)은 스탑 평가를
+        // 기다리지 않고 장 재개 첫 사이클에 즉시 청산해 갭 손실 누적을 끊는다.
+        // eod_flatten 이 꺼진 설정(스윙 허용)이면 표시만 지우고 정상 관리한다.
+        if holds && { state.lock().await.flatten_stale.contains(&code) } {
+            let do_flatten = { state.lock().await.risk.cfg.eod_flatten };
+            if !do_flatten {
+                state.lock().await.flatten_stale.remove(&code);
+            } else {
+                exit(deps, state, token, &code, live_price, "stale_flatten", live_ts).await;
+                let mut s = state.lock().await;
+                if new_bar {
+                    s.last_bar_ts.insert(code.clone(), bar_ts);
+                }
+                let eval = if s.risk.position(&code).is_some() {
+                    Eval::new("이월청산", "전일 이월 포지션 청산 주문 미체결 — 다음 사이클 재시도")
+                } else {
+                    s.flatten_stale.remove(&code);
+                    Eval::new("이월청산", "전일 이월 포지션 — 장 재개 후 즉시 청산")
+                };
+                s.record_monitor(&code, bar_price, live_price, atr, eval);
+                continue;
+            }
+        }
         if holds {
             manage_open(deps, state, token, &code, live_price, bar_price, atr, missed, live_ts, bar_ts).await;
             if new_bar {
@@ -1161,7 +1199,7 @@ async fn exit(deps: &Deps, state: &Arc<Mutex<State>>, token: &str, code: &str, p
         let Some(pos) = s.risk.position(code).cloned() else { return };
         // Stop-outs / EOD / manual closes always exit in full — partial-selling
         // into a falling stop leaves the remainder exposed with no protection.
-        let force_full = matches!(reason, "stop_loss" | "eod_flatten" | "manual_close");
+        let force_full = matches!(reason, "stop_loss" | "eod_flatten" | "stale_flatten" | "manual_close");
         let sell_qty = if force_full || s.order.sell_all || s.order.fixed_qty.is_none() {
             pos.qty
         } else {

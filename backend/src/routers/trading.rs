@@ -236,8 +236,77 @@ async fn filter_tradeable(
     Ok((kept, dropped))
 }
 
+/// 부팅 자동 재개용으로 저장하는 "마지막 시작 요청" 파일 경로.
+fn autostart_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/engine_autostart.json")
+}
+
+/// 엔진 시작 성공 시 시작 요청 본문을 저장한다. 백엔드가 재시작되면 이 파일로
+/// 같은 설정의 엔진을 자동 재개해, 스냅샷에 남은 포지션이 관리 공백(손절/EOD
+/// 청산 누락) 없이 이어지도록 한다. 재현 가능하도록 일회성 키는 제거하고
+/// watchlist 는 (OOS 필터 통과 후의) 최종 목록으로 교체한다.
+fn save_autostart(mode: TradingMode, body: &Value, watchlist: &[String]) {
+    let mut b = body.clone();
+    if let Some(o) = b.as_object_mut() {
+        o.remove("reset");
+        o.remove("confirm_discard");
+        o.remove("require_tradeable");
+        o.insert("watchlist".into(), json!(watchlist));
+        o.insert("mode".into(), json!(mode.as_str()));
+    }
+    let v = json!({
+        "enabled": true,
+        "mode": mode.as_str(),
+        "saved_at": chrono::Utc::now().to_rfc3339(),
+        "body": b,
+    });
+    let path = autostart_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&path, v.to_string()) {
+        tracing::warn!("[autostart] 설정 저장 실패: {e}");
+    }
+}
+
+/// 자동 재개 플래그만 갱신한다. 사용자가 명시적으로 정지(`/trading/stop`,
+/// 텔레그램 /stop)하면 false — 재부팅 시 되살리지 않는다. 시작/재개하면 true.
+pub fn set_autostart_enabled(enabled: bool) {
+    let path = autostart_path();
+    let Ok(raw) = std::fs::read_to_string(&path) else { return };
+    let Ok(mut v) = serde_json::from_str::<Value>(&raw) else { return };
+    v["enabled"] = json!(enabled);
+    let _ = std::fs::write(&path, v.to_string());
+}
+
+/// 백엔드 부팅 시 호출: 저장된 시작 설정이 있고 사용자가 정지하지 않은 상태라면
+/// 엔진을 자동 재개한다 (스냅샷 복원 → 이월 포지션은 첫 사이클에 즉시 청산).
+pub async fn autostart_from_disk(st: AppState) {
+    let Ok(raw) = std::fs::read_to_string(autostart_path()) else { return };
+    let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+        tracing::warn!("[autostart] engine_autostart.json 파싱 실패 — 자동 재개 생략");
+        return;
+    };
+    if !v.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
+        tracing::info!("[autostart] 이전 세션에서 명시적으로 정지됨 — 자동 재개 안 함");
+        return;
+    }
+    let Some(body) = v.get("body").cloned() else { return };
+    let mode = v.get("mode").and_then(Value::as_str).unwrap_or("?").to_string();
+    tracing::info!("[autostart] 백엔드 재시작 감지 — {mode} 엔진 자동 재개 시도");
+    match start_engine(st, body).await {
+        Ok(_) => tracing::info!("[autostart] {mode} 엔진 자동 재개 완료 (스냅샷 포지션 복원 포함)"),
+        Err((code, msg)) => tracing::warn!("[autostart] 자동 재개 실패 ({code}): {msg}"),
+    }
+}
+
 /// `POST /api/trading/start` — start or resume the engine (mode is user-chosen).
 async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult {
+    start_engine(st, body).await
+}
+
+/// Engine start/resume core — shared by the HTTP handler and boot autostart.
+pub async fn start_engine(st: AppState, body: Value) -> ApiResult {
     let settings = &st.settings;
     let mode = TradingMode::parse(body.get("mode").and_then(Value::as_str).unwrap_or(&settings.trading_mode));
     let readiness_report = evaluate(&st.journal, &criteria(settings));
@@ -297,8 +366,9 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
                     format!("이미 {} 모드로 실행 중입니다. 모드를 바꾸려면 먼저 중지하세요.", engine.mode().as_str())));
             }
             engine
-                .reconfigure(cfg, symbol_strats, watchlist, tf, ignore_hours, order_cfg, risk_cfg, settings.trading_paper_seed)
+                .reconfigure(cfg, symbol_strats, watchlist.clone(), tf, ignore_hours, order_cfg, risk_cfg, settings.trading_paper_seed)
                 .await;
+            save_autostart(mode, &body, &watchlist);
             let status = engine.status().await;
             return Ok(Json(json!({
                 "ok": true, "mode": mode.as_str(), "resumed": true, "reconfigured": true,
@@ -335,6 +405,9 @@ async fn start(State(st): State<AppState>, Json(body): Json<Value>) -> ApiResult
             }
         }
     }
+
+    // 이 지점 이후는 실패 경로가 없다 — 시작이 확정되므로 자동 재개 설정을 저장.
+    save_autostart(mode, &body, &watchlist);
 
     let engine: Arc<TradingEngine>;
     let mut restored = false;
@@ -404,6 +477,8 @@ async fn stop(State(st): State<AppState>) -> ApiResult {
         return Err((StatusCode::NOT_FOUND, "no engine".into()));
     };
     engine.stop().await;
+    // 사용자가 의도적으로 정지 — 백엔드 재시작 시 자동 재개하지 않는다.
+    set_autostart_enabled(false);
     Ok(Json(json!({"ok": true, "status": engine.status().await})))
 }
 
