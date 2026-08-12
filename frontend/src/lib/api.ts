@@ -13,7 +13,6 @@ export interface Candle {
 
 export interface PatternResult {
   pattern_name: string;
-  pattern_type: 'bullish' | 'bearish';
   detected_at: string;
   confidence: number;
   composite_score: number;
@@ -34,7 +33,6 @@ export interface SignalItem {
   price?: number;
   change_pct?: number;
   pattern_name: string;
-  pattern_type: 'bullish' | 'bearish';
   confidence: number;
   composite_score: number;
   atr_normalized?: boolean;
@@ -86,8 +84,7 @@ export interface TradeEvent {
   code: string;
   name: string;
   type: 'buy' | 'sell';
-  side?: 'long' | 'short';   // 롱/숏 (숏은 페이퍼 시뮬레이션)
-  action?: 'open' | 'close'; // 진입/청산
+  action?: 'open' | 'close'; // 진입(매수)/청산(매도)
   price: number;
   qty: number;
   pnl: number;
@@ -208,12 +205,17 @@ export const api = {
     if (params.maxPrice != null) u.set('max_price', String(params.maxPrice));
     if (params.q) u.set('q', params.q);
     if (params.limit != null) u.set('limit', String(params.limit));
-    return jget<{ total: number; items: UniverseItem[] }>(`/api/universe?${u.toString()}`);
+    return jget<{
+      total: number; items: UniverseItem[];
+      universe_as_of?: string; universe_age_days?: number; universe_stale?: boolean;
+    }>(`/api/universe?${u.toString()}`);
   },
   // 관심종목 전체 × 전략 프리셋(트레이더) 매트릭스 검증 + 베스트 전략 판정
   strategyMatrix: (body: Record<string, unknown>) => jpost<any>(`/api/backtest/strategy-matrix`, body),
   // 관심종목 패턴별 통계(참고용)
   batchBacktest: (body: Record<string, unknown>) => jpost<any>(`/api/backtest/batch`, body),
+  // 타임프레임별 OOS 표본 용량 (보유봉수 상한 계산용)
+  backtestCapacity: () => jget<OosCapacity>(`/api/backtest/capacity`),
   presets: () => jget<Record<string, any>>(`/api/trading/presets`),
   tradingStart: (body: Record<string, unknown>) => jpost<any>(`/api/trading/start`, body),
   tradingStop: () => jpost<any>(`/api/trading/stop`, {}),
@@ -232,6 +234,26 @@ export const api = {
   // stock_monitor 텔레그램 방으로 상태/모니터링/최근 거래내역 요약을 전송한다.
   telegramReport: () => jpost<{ ok: boolean }>(`/api/trading/telegram/report`, {}),
 };
+
+/** 타임프레임별 walk-forward OOS 표본 용량 (`GET /api/backtest/capacity`). */
+export interface OosCapacityRow {
+  tf: string;
+  /** 이 타임프레임에서 조회하는 캔들 수 (qrycnt). */
+  candles: number;
+  /** 실제 적용되는 폴드 수 (봉이 적으면 1로 폴백). */
+  folds: number;
+  /** 폴드 1개당 검정 봉수 = candles / (folds+1). */
+  fold_bars: number;
+  /** 검정 구간 총 봉수 = fold_bars × folds. */
+  oos_test_bars: number;
+  /** 최소 표본(min_oos_signals)을 채울 수 있는 보유봉수 상한. */
+  max_hold_for_min_signals: number;
+}
+export interface OosCapacity {
+  oos_folds: number;
+  min_oos_signals: number;
+  timeframes: OosCapacityRow[];
+}
 
 export interface CriterionResult {
   key: string;

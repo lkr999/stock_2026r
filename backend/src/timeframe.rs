@@ -61,6 +61,12 @@ impl Timeframe {
         TimeframeConfig { ncnt, qrycnt, trend_lookback: lookback }
     }
 
+    /// Every supported timeframe, shortest first (UI lists / capacity tables).
+    pub fn all() -> [Timeframe; 8] {
+        use Timeframe::*;
+        [M1, M3, M5, M10, M15, M30, H1, D1]
+    }
+
     /// Higher timeframes used for MTF confluence (spec section 9-3).
     pub fn mtf_group(self) -> Vec<Timeframe> {
         use Timeframe::*;

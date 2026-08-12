@@ -1,10 +1,34 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { get } from 'svelte/store';
-  import { api } from '$lib/api';
+  import { api, type OosCapacity } from '$lib/api';
   import { watchlist } from '$lib/stores/watchlist';
 
   let tf = 'auto';   // 'auto' = 전략마다 권장 타임프레임으로 백테스트
   let holdBars = 25;
+  /** 타임프레임별 OOS 표본 용량 (서버가 walk-forward 산식으로 계산해 내려준다). */
+  let capacity: OosCapacity | null = null;
+  onMount(async () => {
+    try { capacity = await api.backtestCapacity(); } catch { capacity = null; }
+  });
+
+  // auto 모드는 전략마다 TF가 달라지므로, 실제로 쓰이는 TF 중 가장 빡빡한(=봉이 적은)
+  // 쪽을 기준으로 경고한다. 단타 프리셋 1m + 반전 프리셋 5m 이 auto 의 구성이다.
+  $: capRows = capacity?.timeframes ?? [];
+  $: capFor = (t: string) => capRows.find((r) => r.tf === t) ?? null;
+  $: activeCaps = tf === 'auto'
+    ? capRows.filter((r) => r.tf === '1m' || r.tf === '5m')
+    : [capFor(tf)].filter(Boolean) as typeof capRows;
+  /** 현재 (TF, 보유봉수) 조합에서 이론상 나올 수 있는 최대 OOS 신호 수. */
+  $: signalCap = activeCaps.length
+    ? Math.min(...activeCaps.map((r) => Math.floor(r.oos_test_bars / Math.max(1, holdBars))))
+    : null;
+  $: minSignals = capacity?.min_oos_signals ?? 10;
+  /** 최소 표본을 채울 수 있는 보유봉수 상한 (활성 TF 중 가장 작은 값). */
+  $: holdCeiling = activeCaps.length
+    ? Math.min(...activeCaps.map((r) => r.max_hold_for_min_signals))
+    : null;
+  $: capacityOk = signalCap == null || signalCap >= minSignals;
   let matrix: any = null;       // 트레이더 × 종목 검증
   let batch: any = null;        // 패턴별 통계(참고)
   let filterStrategy = 'all';   // 매트릭스 표 트레이더 필터
@@ -52,7 +76,7 @@
 </script>
 
 <h1>백테스트 — 관심종목 전체 검증</h1>
-<p class="sub">대시보드에서 선택한 <strong>자동매매 관심종목 전체</strong>를 대상으로, 모든 전략 프리셋(트레이더)을 종목별로 검증하고 실제 베스트 전략을 비교합니다. 반전 패턴 전략과 <strong>단타 셋업(VWAP·시가돌파·EMA눌림목, 롱+숏)</strong>이 함께 포함됩니다. (왕복 거래비용 차감)</p>
+<p class="sub">대시보드에서 선택한 <strong>자동매매 관심종목 전체</strong>를 대상으로, 모든 전략 프리셋(트레이더)을 종목별로 검증하고 실제 베스트 전략을 비교합니다. 반전 패턴 전략과 <strong>단타 셋업(VWAP·시가돌파·EMA눌림목)</strong>이 함께 포함됩니다. (왕복 거래비용 차감)</p>
 
 <div class="help">
   <button class="help-toggle" on:click={() => showHelp = !showHelp}>
@@ -66,9 +90,13 @@
         <li><b>청산</b>: ATR 기반 <b>손절 / 익절 / 트레일링 스톱</b> 중 먼저 닿는 선에서 청산하고, 어디에도 닿지 않으면 <b>보유봉수</b> 도달 시 시간청산합니다.</li>
         <li><b>거래비용</b>: 매수·매도 왕복 수수료 + 세금 + 슬리피지({matrix?.round_trip_cost_pct?.toFixed(3) ?? batch?.round_trip_cost_pct?.toFixed(3) ?? '0.230'}%)를 차감한 <b>순수익</b>으로 평가합니다.</li>
         <li><b>OOS 검증</b>: 데이터를 walk-forward로 4분할해 <b>학습에 쓰지 않은 구간(out-of-sample)</b>의 성과만 집계합니다. 과최적화를 배제한 실전 기대값입니다.</li>
+        <li><b>실거래 정합성</b>: 백테스트가 실거래 엔진과 <b>같은 조건</b>으로 돌아갑니다 —
+          ① 손절/익절 체결가는 <b>닫힌 봉의 종가</b>(하드스탑 ON이면 스탑가), ② <b>MTF 컨플루언스 점수</b>를 종합점수에 반영,
+          ③ <b>상위TF 하락추세면 진입 차단</b>, ④ <b>EOD 강제청산</b>으로 세션을 넘기지 않음.
+          상위TF는 베이스 봉을 리샘플링해 만들며 <b>마감된 상위 봉만</b> 사용하므로 미래참조가 없습니다.</li>
         <li><b>tradeable(통과) 판정</b>: OOS 순수익 &gt; 0, OOS 일관성 ≥ 60%, OOS 표본 ≥ 10건을 모두 만족해야 합니다.</li>
         <li><b>반전 트레이더</b>: <code>conservative</code>(보수·높은 임계) · <code>balanced</code>(균형) · <code>aggressive</code>(공격·낮은 임계) · <code>ml_blended</code>(ML 혼합)는 각각 점수 가중치·진입 임계·사용 패턴이 다릅니다.</li>
-        <li><b>단타 트레이더 (롱+숏)</b>: <code>vwap_scalp</code>(VWAP 되찾기/되돌림) · <code>orb_breakout</code>(시가 레인지 돌파) · <code>ema_pullback</code>(EMA 눌림목 연속) · <code>intraday_blended</code>(혼합). 모두 <b>1분봉</b> 기준 세션 VWAP·개장 레인지·EMA 컨텍스트로 진입하며, 하락 셋업은 <b>숏(페이퍼 시뮬레이션)</b>으로 진입합니다.</li>
+        <li><b>단타 트레이더</b>: <code>vwap_scalp</code>(VWAP 되찾기/되돌림) · <code>orb_breakout</code>(시가 레인지 돌파) · <code>ema_pullback</code>(EMA 눌림목 연속) · <code>intraday_blended</code>(혼합). 모두 <b>1분봉</b> 기준 세션 VWAP·개장 레인지·EMA 컨텍스트에서 <b>매수 진입</b>합니다.</li>
         <li><b>타임프레임 <code>auto</code> (기본)</b>: 각 트레이더를 <b>자신의 권장 타임프레임</b>(반전 전략 5m · 단타 전략 1m)으로 검증합니다. 반전·단타 전략을 한 화면에서 <b>공정하게</b> 비교하려면 auto를 쓰고, 특정 봉으로 통일해 보려면 봉을 직접 선택하세요. (auto는 종목당 1m·5m 둘 다 조회하므로 시간이 더 걸립니다.)</li>
       </ul>
       <h4>보유봉수란?</h4>
@@ -76,6 +104,38 @@
         매수 후 손절·익절·트레일링에 닿지 않아도 <b>최대로 보유하는 봉(캔들) 개수</b>입니다. 이 봉수에 도달하면 손익과 무관하게 <b>시간청산</b>합니다.
         실제 보유 시간은 <b>타임프레임 × 보유봉수</b>입니다 — 예: <code>5m</code> · 보유봉수 <code>25</code> ≈ 최대 125분 보유 후 청산.
         <b>짧을수록</b> 회전이 빠르고 자금이 덜 묶이지만 추세 수익을 일찍 끊을 수 있고, <b>길수록</b> 추세 수익을 더 담지만 자금이 오래 묶이고 역추세 위험이 커집니다.
+      </p>
+
+      <h4>보유봉수 × 타임프레임 → OOS 표본 수 (통과 여부를 좌우합니다)</h4>
+      <p>
+        타임프레임마다 <b>조회하는 캔들 수가 고정</b>돼 있습니다 (1m·3m 500봉, 5m 300봉, 10m·15m 200봉, 30m·60m 100봉, 1d 60봉).
+        OOS 검증은 이 데이터를 <b>{capacity?.oos_folds ?? 4}+1 등분</b>해 뒤쪽 {capacity?.oos_folds ?? 4}개 구간만 채점하므로,
+        실제 채점에 쓰이는 봉은 전체의 <b>{capacity?.oos_folds ?? 4}/{(capacity?.oos_folds ?? 4) + 1}</b> 입니다.
+      </p>
+      <p>
+        그리고 백테스트는 <b>포지션을 중첩하지 않습니다</b> — 한 번 진입하면 청산될 때까지(최대 보유봉수) 다음 신호를 찾지 않습니다. 따라서:
+      </p>
+      <pre class="formula">최대 OOS 신호 수 = (조회봉수 × {capacity?.oos_folds ?? 4}/{(capacity?.oos_folds ?? 4) + 1}) ÷ 보유봉수
+통과 조건       = OOS 신호 ≥ {capacity?.min_oos_signals ?? 10}건  →  보유봉수 ≤ 조회봉수 × {capacity?.oos_folds ?? 4}/{(capacity?.oos_folds ?? 4) + 1} ÷ {capacity?.min_oos_signals ?? 10}</pre>
+      {#if capRows.length}
+        <table class="cap-table">
+          <thead><tr><th>TF</th><th>조회봉수</th><th>폴드</th><th>폴드당 검정봉</th><th>검정 총봉수</th><th>보유봉수 상한 (신호 {capacity?.min_oos_signals ?? 10}건)</th></tr></thead>
+          <tbody>
+            {#each capRows as r}
+              <tr class:cur={tf === r.tf}>
+                <td><code>{r.tf}</code></td><td class="n">{r.candles}</td>
+                <td class="n" class:warn={r.folds < (capacity?.oos_folds ?? 4)}>{r.folds}</td>
+                <td class="n">{r.fold_bars}</td>
+                <td class="n">{r.oos_test_bars}</td><td class="n hi">{r.max_hold_for_min_signals}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {/if}
+      <p class="caveat">
+        위 상한은 <b>모든 봉에서 신호가 나온다고 가정한 이론적 최대치</b>입니다. 실제 신호 밀도는 진입 임계값·확인봉·상위TF 게이트 때문에
+        훨씬 낮으므로, 여유를 두려면 <b>상한의 1/2~1/3</b> 수준에서 시작하세요. 반대로 상한을 넘기면 전략 성능과 무관하게
+        <b>구조적으로</b> 통과가 불가능합니다.
       </p>
     </div>
   {/if}
@@ -87,8 +147,17 @@
       <option value="auto">auto (전략별 권장 TF)</option>
       {#each ['1m','3m','5m','10m','15m','30m','60m','1d'] as t}<option value={t}>{t}</option>{/each}
     </select></div>
-  <div class="group"><label title="매수 후 최대 보유 봉수 (도달 시 시간청산)">보유봉수</label>
-    <select bind:value={holdBars}>{#each [5,10,25,40,60] as h}<option value={h}>{h}</option>{/each}</select></div>
+  <div class="group"><label title="매수 후 최대 보유 봉수 (도달 시 시간청산). 1 이상 자유롭게 입력할 수 있습니다.">보유봉수</label>
+    <div class="hold-input">
+      <input type="number" bind:value={holdBars} min="1" max="2000" step="1"
+        on:change={() => { if (!holdBars || holdBars < 1) holdBars = 1; }} />
+      <div class="presets">
+        {#each [5,10,25,40,60,100,200] as h}
+          <button type="button" class:on={holdBars === h} on:click={() => holdBars = h}>{h}</button>
+        {/each}
+      </div>
+    </div>
+  </div>
   <button class="verify" on:click={runMatrix} disabled={loading} title="관심종목 전체를 모든 트레이더(전략)로 종목별 OOS 검증하고 베스트 전략을 비교">
     ★ 관심종목 전체 검증 ({$watchlist.length})
   </button>
@@ -96,6 +165,33 @@
     패턴별 통계 (참고)
   </button>
 </div>
+
+{#if signalCap != null}
+  <div class="capacity {capacityOk ? 'ok' : 'bad'}">
+    <div class="cap-head">
+      {capacityOk ? '✅' : '⚠️'}
+      <b>{tf === 'auto' ? 'auto(1m·5m)' : tf}</b> · 보유 <b>{holdBars}</b>봉 →
+      OOS 신호 최대 <b>{signalCap}건</b> (통과 최소 {minSignals}건)
+    </div>
+    <div class="cap-body">
+      {#each activeCaps as r}
+        <span class="cap-chip">
+          <b>{r.tf}</b> 조회 {r.candles}봉 · 검정 {r.oos_test_bars}봉({r.folds}폴드 × {r.fold_bars}봉)
+          · 보유봉수 상한 <b>{r.max_hold_for_min_signals}</b>
+          {#if r.folds < (capacity?.oos_folds ?? 4)}<em class="cap-note">봉 부족 → 단일분할</em>{/if}
+        </span>
+      {/each}
+    </div>
+    {#if !capacityOk}
+      <div class="cap-warn">
+        보유봉수가 너무 커서 <b>전략 성능과 무관하게 tradeable 이 될 수 없습니다.</b>
+        {#if holdCeiling}보유봉수를 <b>{holdCeiling}봉 이하</b>로 줄이거나{/if}
+        더 짧은 타임프레임(=조회 봉수가 많은 쪽)을 선택하세요.
+        백테스트는 포지션을 중첩하지 않으므로, 한 번 진입하면 최대 보유봉수만큼 봉을 소비합니다.
+      </div>
+    {/if}
+  </div>
+{/if}
 
 {#if error}<div class="error">{error}</div>{/if}
 {#if loading}<p>계산중… (트레이더 × 종목 검증은 종목 수에 비례해 시간이 걸립니다)</p>{/if}
@@ -122,13 +218,12 @@
   <div class="panel">
     <h3>전략(트레이더) 비교 — {matrix.count}종목 · {matrix.auto ? 'TF auto(전략별 권장)' : matrix.timeframe} · 보유 {matrix.max_hold_bars}봉 (best 순)</h3>
     <table>
-      <thead><tr><th>순위</th><th>트레이더</th><th>방향</th><th>TF</th><th>진입임계</th><th>통과 종목</th><th>OOS 순수익(가중)</th><th>OOS 일관성</th><th>OOS 신호</th><th>적용</th></tr></thead>
+      <thead><tr><th>순위</th><th>트레이더</th><th>TF</th><th>진입임계</th><th>통과 종목</th><th>OOS 순수익(가중)</th><th>OOS 일관성</th><th>OOS 신호</th><th>적용</th></tr></thead>
       <tbody>
         {#each matrix.by_strategy as s, i}
           <tr class:winner={s.strategy === matrix.best_strategy}>
             <td>{i === 0 ? '🏆 1' : i + 1}</td>
             <td><strong>{s.strategy}</strong></td>
-            <td>{#if s.direction === 'both'}<span class="badge short">롱+숏</span>{:else}<span class="badge long">롱</span>{/if}</td>
             <td class="cd">{s.tf ?? matrix.timeframe}</td>
             <td>{s.entry_threshold}</td>
             <td class={s.tradeable_count > 0 ? 'pos' : ''}>{s.tradeable_count} / {matrix.count}</td>
@@ -251,8 +346,35 @@
   th { text-align: left; padding: 7px; color: #bac2de; border-bottom: 1px solid #313244; font-weight: 500; }
   td { padding: 7px; border-bottom: 1px solid #232334; }
   .pos { color: #a6e3a1; } .neg { color: #f38ba8; }
-  .badge { font-size: 11px; padding: 1px 7px; border-radius: 10px; font-weight: 600; }
-  .badge.long { background: #1d2a1d; color: #a6e3a1; }
-  .badge.short { background: #2a1d2a; color: #f5c2e7; }
   .error { background: #f38ba8; color: #1e1e2e; padding: 10px; border-radius: 6px; margin-bottom: 12px; }
+
+  /* 보유봉수 자유 입력 + 프리셋 */
+  .hold-input { display: flex; flex-direction: column; gap: 5px; }
+  .hold-input input { width: 96px; background: #1e1e2e; color: #cdd6f4; border: 1px solid #45475a;
+                      border-radius: 4px; padding: 6px 8px; font-variant-numeric: tabular-nums; }
+  .presets { display: flex; gap: 3px; flex-wrap: wrap; }
+  .presets button { background: #1e1e2e; color: #a6adc8; border: 1px solid #313244; border-radius: 4px;
+                    padding: 2px 7px; font-size: 11px; cursor: pointer; }
+  .presets button:hover { border-color: #585b70; color: #cdd6f4; }
+  .presets button.on { background: #313244; color: #cdd6f4; border-color: #89b4fa; font-weight: 600; }
+
+  /* OOS 표본 용량 배너 */
+  .capacity { border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; font-size: 12.5px; line-height: 1.6; }
+  .capacity.ok { background: #1a2a1f; border-left: 3px solid #a6e3a1; color: #cdd6f4; }
+  .capacity.bad { background: #2a2416; border-left: 3px solid #f9e2af; color: #f9e2af; }
+  .cap-head { font-size: 13px; }
+  .cap-body { margin-top: 4px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .cap-chip { background: #00000033; border-radius: 4px; padding: 2px 7px; font-size: 11.5px; color: #a6adc8; }
+  .cap-warn { margin-top: 6px; padding-top: 6px; border-top: 1px solid #ffffff1a; }
+
+  .formula { background: #11111b; border: 1px solid #313244; border-radius: 6px; padding: 10px 12px;
+             font-size: 12px; color: #a6e3a1; white-space: pre-wrap; margin: 8px 0; }
+  .cap-table { width: auto; margin: 8px 0; font-size: 12px; }
+  .cap-table th, .cap-table td { padding: 4px 12px 4px 0; }
+  .cap-table td.n { text-align: right; font-variant-numeric: tabular-nums; }
+  .cap-table td.hi { color: #f9e2af; font-weight: 600; }
+  .cap-table tr.cur { background: #ffffff0d; }
+  .cap-table td.warn { color: #f38ba8; font-weight: 600; }
+  .cap-note { color: #f38ba8; font-style: normal; font-size: 10.5px; margin-left: 4px; }
+  .caveat { font-size: 12px; color: #a6adc8; }
 </style>

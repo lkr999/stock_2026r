@@ -11,9 +11,13 @@ use crate::candle::Candle;
 use crate::candle_fetcher::CandleFetcher;
 use crate::ebest::EBestService;
 use crate::journal::{now_iso, TradeJournal, TradeRecord};
+use crate::market::{self, MarketContext};
 use crate::mtf::MtfEngine;
-use crate::pattern::{apply_strategy, compute_atr, detect_setups, PatternDetector, PatternResult, SetupSeries};
-use crate::risk::{RiskConfig, RiskManager, Side};
+use crate::pattern::{
+    apply_strategy, compute_atr, detect_setups, detect_v2_setups, PatternDetector, PatternResult,
+    SetupSeries,
+};
+use crate::risk::{RiskConfig, RiskManager};
 use crate::session::SessionContext;
 use crate::strategy::{Source, StrategyConfig};
 use crate::timeframe::Timeframe;
@@ -34,10 +38,9 @@ pub struct OrderConfig {
     pub order_type: String,
     pub fixed_qty: Option<i64>,
     pub sell_all: bool,
-    /// Cap on **total entered amount** across all open positions (Σ entry×qty,
-    /// both longs and shorts) — not a per-order limit. New entries and
-    /// averaging-down adds are sized down so the running total never exceeds
-    /// this (0 = uncapped).
+    /// Cap on **total entered amount** across all open positions (Σ entry×qty)
+    /// — not a per-order limit. New entries and averaging-down adds are sized
+    /// down so the running total never exceeds this (0 = uncapped).
     pub max_buy_amount: f64,
 }
 
@@ -166,6 +169,10 @@ struct State {
     unmanaged_holdings: Vec<String>,
     trade_events: Vec<Value>,
     monitor: HashMap<String, Value>, // code -> latest per-cycle monitoring snapshot
+    /// Latest broad-market read, populated only while a v2 strategy with a
+    /// market filter is running (surfaced in status so the operator can see why
+    /// entries are being held back).
+    market: Option<MarketContext>,
 }
 
 /// On-disk engine snapshot (per mode) so a backend restart doesn't orphan open
@@ -185,6 +192,11 @@ struct Snapshot {
     cooldown: HashMap<String, i64>,
     last_exit_price: HashMap<String, (f64, i64)>,
     bars_held: HashMap<String, i64>,
+    /// 종목별로 마지막으로 *처리한* 닫힌 봉의 타임스탬프. 이걸 저장하지 않으면
+    /// 재시작 직후 모든 종목이 `missed=1`(새 봉)로 평가돼 직전 세션 마감봉으로
+    /// 진입·청산이 다시 한 번 발생한다. 구버전 스냅샷 호환을 위해 `default`.
+    #[serde(default)]
+    last_bar_ts: HashMap<String, i64>,
 }
 
 fn snapshot_path(mode: TradingMode) -> PathBuf {
@@ -207,9 +219,22 @@ fn tf_secs(tf: Timeframe) -> i64 {
     }
 }
 
+/// 캐시 TTL(최대 180초) + 대형 워치리스트 사이클 지연을 흡수하는 여유분.
+const STALE_BAR_SLACK_SECS: i64 = 300;
+
+/// 마지막 닫힌 봉이 이보다 오래되면 "정지된 데이터"로 보고 매매 판정을 건너뛴다.
+/// 장 마감 후·휴장일·데이터 피드 장애 상황에서 직전 세션 종가로 진입/청산이
+/// 체결되는 것을 막는 최종 방어선 — `ignore_market_hours` 설정과 무관하게 적용된다.
+fn stale_after_secs(tf: Timeframe) -> i64 {
+    match tf {
+        // 일봉은 주말·연휴를 건너뛰므로 넉넉히 잡는다.
+        Timeframe::D1 => 5 * 86_400,
+        _ => tf_secs(tf) * 3 + STALE_BAR_SLACK_SECS,
+    }
+}
+
 impl State {
-    /// Equity = cash + position marks. Longs are valued at market; short opens
-    /// credit no cash, so they contribute only their unrealized P&L (entry−price).
+    /// Equity = cash + position marks (every position is a long, valued at market).
     fn equity(&self) -> f64 {
         let held: f64 = self
             .risk
@@ -217,10 +242,7 @@ impl State {
             .iter()
             .map(|(code, p)| {
                 let cur = self.current_prices.get(code).copied().unwrap_or(p.entry);
-                match p.side {
-                    Side::Long => p.qty as f64 * cur,
-                    Side::Short => (p.entry - cur) * p.qty as f64,
-                }
+                p.qty as f64 * cur
             })
             .sum();
         self.cash + held
@@ -236,6 +258,13 @@ impl State {
     /// Strategy used for `code`: the per-symbol override, else the global strategy.
     fn strategy_for(&self, code: &str) -> StrategyConfig {
         self.symbol_strategies.get(code).cloned().unwrap_or_else(|| self.strategy.clone())
+    }
+
+    /// Risk rules `code` is actually traded under: the operator's base config
+    /// with its strategy's overrides applied. Legacy strategies override
+    /// nothing, so they get the base config unchanged.
+    fn risk_for(&self, code: &str) -> RiskConfig {
+        self.strategy_for(code).effective_risk(&self.risk.cfg)
     }
 
     /// Timeframe `code` trades on: the assigned strategy's recommended TF, else the global TF.
@@ -277,6 +306,7 @@ impl State {
             cooldown: self.cooldown.clone(),
             last_exit_price: self.last_exit_price.clone(),
             bars_held: self.bars_held.clone(),
+            last_bar_ts: self.last_bar_ts.clone(),
         };
         let path = snapshot_path(mode);
         if let Some(dir) = path.parent() {
@@ -364,6 +394,7 @@ impl TradingEngine {
             unmanaged_holdings: vec![],
             trade_events: vec![],
             monitor: HashMap::new(),
+            market: None,
         }));
         Self { deps, state, mode, task: std::sync::Mutex::new(None) }
     }
@@ -390,6 +421,8 @@ impl TradingEngine {
         s.cooldown = snap.cooldown;
         s.last_exit_price = snap.last_exit_price;
         s.bars_held = snap.bars_held;
+        // 이미 처리한 봉을 다시 거래하지 않도록 복원 (재시작 중복 진입/청산 방지).
+        s.last_bar_ts = snap.last_bar_ts;
         let n = snap.positions.len();
         s.risk.restore_positions(snap.positions);
         if snap.day == kst_today() {
@@ -535,14 +568,11 @@ impl TradingEngine {
         let Some(pos) = s.risk.position(code).cloned() else {
             return json!({"ok": false, "reason": "no_position"});
         };
-        let (qty, entry, side) = (pos.qty, pos.entry, pos.side);
+        let (qty, entry) = (pos.qty, pos.entry);
         let order_type = s.order.order_type.clone();
         s.closing.insert(code.to_string());
         drop(s);
-        let fill = match side {
-            Side::Long => self.deps.broker.sell(&token, code, qty, price, &order_type).await,
-            Side::Short => self.deps.broker.cover(&token, code, qty, price, &order_type).await,
-        };
+        let fill = self.deps.broker.sell(&token, code, qty, price, &order_type).await;
         if !fill.ok || fill.qty <= 0 {
             self.state.lock().await.closing.remove(code);
             return json!({"ok": false, "reason": "order_failed"});
@@ -551,19 +581,15 @@ impl TradingEngine {
         let sold = fill.qty.min(qty);
         let mut s = self.state.lock().await;
         s.closing.remove(code);
-        let dir = if side == Side::Short { -1.0 } else { 1.0 };
-        let pnl = (fill.fill_price - entry) * sold as f64 * dir;
-        match side {
-            Side::Long => s.cash += sold as f64 * fill.fill_price,
-            Side::Short => s.cash += pnl,
-        }
-        let pnl_pct = if entry != 0.0 { (fill.fill_price - entry) / entry * 100.0 * dir } else { 0.0 };
+        let pnl = (fill.fill_price - entry) * sold as f64;
+        s.cash += sold as f64 * fill.fill_price;
+        let pnl_pct = if entry != 0.0 { (fill.fill_price - entry) / entry * 100.0 } else { 0.0 };
         let fully = sold >= qty;
         record_close(&self.deps, &mut s, code, &pos, fill.fill_price, "manual_close", sold, fully);
         s.risk.reduce(code, sold, pnl);
         s.append_event(json!({
-            "code": code, "name": name_for(code), "side": side.as_str(),
-            "type": if side == Side::Short { "buy" } else { "sell" }, "action": "close",
+            "code": code, "name": name_for(code),
+            "type": "sell", "action": "close",
             "price": fill.fill_price,
             "qty": sold, "pnl": pnl.round(), "pnl_pct": (pnl_pct * 100.0).round() / 100.0,
             "reason": "manual_close", "ts": candle_ts, "time_label": hhmm_label(),
@@ -587,19 +613,35 @@ impl TradingEngine {
             .iter()
             .map(|(code, p)| {
                 let cur = s.current_prices.get(code).copied().unwrap_or(p.entry);
-                let dir = if p.side == Side::Short { -1.0 } else { 1.0 };
-                let upnl = (cur - p.entry) * p.qty as f64 * dir;
-                let upct = if p.entry != 0.0 { (cur - p.entry) / p.entry * 100.0 * dir } else { 0.0 };
+                let upnl = (cur - p.entry) * p.qty as f64;
+                let upct = if p.entry != 0.0 { (cur - p.entry) / p.entry * 100.0 } else { 0.0 };
                 let meta = s.opened_meta.get(code);
+                let strat = s.strategy_for(code);
+                let eff = strat.effective_risk(&s.risk.cfg);
+                // Risk taken and reward left, in R multiples — lets the UI show
+                // "where in the trade are we" instead of just a won/lost colour.
+                let risk_amt = (p.entry - p.stop).max(0.0);
+                let r_multiple = if risk_amt > 0.0 { (cur - p.entry) / risk_amt } else { 0.0 };
+                let span = (p.target - p.stop).max(1e-9);
                 json!({
-                    "code": code, "name": name_for(code), "side": p.side.as_str(),
+                    "code": code, "name": name_for(code),
                     "entry": p.entry, "qty": p.qty, "stop": p.stop, "target": p.target,
                     "peak": p.peak, "base_qty": p.base_qty, "fib_level": p.fib_level,
                     "buy_price": p.entry.round(), "current_price": cur.round(),
                     "unrealized_pnl": upnl.round(), "unrealized_pct": (upct * 100.0).round() / 100.0,
                     "pattern": meta.map(|m| m.1.clone()).unwrap_or_default(),
                     "opened_at": meta.map(|m| m.0.clone()).unwrap_or_default(),
-                    "strategy": s.strategy_for(code).name, "tf": s.tf_for(code).as_str(),
+                    "strategy": strat.name, "tf": s.tf_for(code).as_str(),
+                    "generation": strat.generation.as_str(),
+                    // Position of the live price on the stop→target axis (0..1).
+                    "progress": (((cur - p.stop) / span).clamp(0.0, 1.0) * 1000.0).round() / 1000.0,
+                    "r_multiple": (r_multiple * 100.0).round() / 100.0,
+                    "stop_pct": if p.entry > 0.0 { ((p.stop - p.entry) / p.entry * 10000.0).round() / 100.0 } else { 0.0 },
+                    "target_pct": if p.entry > 0.0 { ((p.target - p.entry) / p.entry * 10000.0).round() / 100.0 } else { 0.0 },
+                    "use_take_profit": eff.use_take_profit,
+                    "use_trailing_stop": eff.use_trailing_stop,
+                    "hard_stop_intrabar": eff.hard_stop_intrabar,
+                    "bars_held": s.bars_held.get(code).copied().unwrap_or(0),
                 })
             })
             .collect();
@@ -621,12 +663,29 @@ impl TradingEngine {
         let symbol_strategies: serde_json::Map<String, Value> = s
             .symbol_strategies
             .iter()
-            .map(|(code, cfg)| (code.clone(), json!({"strategy": cfg.name, "tf": cfg.recommended_tf().as_str()})))
+            .map(|(code, cfg)| {
+                (
+                    code.clone(),
+                    json!({
+                        "strategy": cfg.name,
+                        "tf": cfg.recommended_tf().as_str(),
+                        "generation": cfg.generation.as_str(),
+                    }),
+                )
+            })
             .collect();
+        // The risk config the *global* strategy actually trades with, after its
+        // own overrides — this is what the operator needs to see, not the raw
+        // form values a v2 preset has already replaced.
+        let effective_risk = s.strategy.effective_risk(&s.risk.cfg);
         json!({
             "running": s.running,
             "mode": self.mode.as_str(),
             "strategy": s.strategy.name,
+            "generation": s.strategy.generation.as_str(),
+            "strategy_summary": s.strategy.summary,
+            "market_filter": s.strategy.to_json()["market_filter"].clone(),
+            "market": s.market.as_ref().map(|m| m.to_json()),
             "timeframe": s.tf.as_str(),
             "symbol_strategies": symbol_strategies,
             "watchlist": s.watchlist,
@@ -635,7 +694,6 @@ impl TradingEngine {
             "seed_cash": s.seed_cash.round(),
             "entry_threshold": s.strategy.entry_threshold,
             "weights": weights,
-            "direction": s.strategy.direction,
             "cycles": s.cycles,
             "cash": s.cash.round(),
             "equity": s.equity().round(),
@@ -645,7 +703,9 @@ impl TradingEngine {
             "monitor": monitor,
             "monitor_summary": monitor_summary,
             "order": s.order.to_json(),
-            "risk": s.risk.cfg.to_json(),
+            "risk": effective_risk.to_json(),
+            "risk_form": s.risk.cfg.to_json(),
+            "risk_overrides": s.strategy.to_json()["risk_overrides"].clone(),
             "unmanaged_holdings": s.unmanaged_holdings,
             "last_error": s.last_error,
         })
@@ -831,8 +891,8 @@ async fn reconcile_live(deps: &Deps, state: &Arc<Mutex<State>>, token: &str) {
         .map(|(c, p)| (c.clone(), p.clone()))
         .collect();
     for (code, pos) in &tracked {
-        if pos.side == Side::Short || s.closing.contains(code) {
-            continue; // shorts never live; in-flight closes settle next cycle
+        if s.closing.contains(code) {
+            continue; // in-flight closes settle next cycle
         }
         match acct.get(code) {
             Some((avg, qty)) => {
@@ -868,20 +928,23 @@ enum EodPhase {
     Flatten, // force-close everything before the session ends
 }
 
-/// EOD phase: entries stop at 15:05, everything is flattened from 15:10 (the
-/// engine's session ends 15:20). Only active when `eod_flatten` is on and real
-/// market hours are respected — ignoring hours (off-hours testing) would
-/// otherwise flatten instantly at any evening test run.
+/// EOD phase: entries stop at 15:05, everything is flattened between 15:10 and
+/// 16:00 (the engine's session ends 15:20).
+///
+/// `ignore_market_hours` 는 더 이상 이 게이트를 끄지 않는다 — 장시간 무시는
+/// "장외에도 루프를 돌린다"는 뜻이지 "마감 리스크 관리를 끈다"는 뜻이 아니며,
+/// 실제로 그 조합이 밤샘 보유 → 갭 손실의 주원인이었다. 저녁 내내 청산 상태로
+/// 눌러앉지 않도록 강제청산 구간에는 상한(16:00)을 둔다.
 fn eod_phase(s: &State) -> EodPhase {
-    if !s.risk.cfg.eod_flatten || s.ignore_market_hours {
+    if !s.risk.cfg.eod_flatten {
         return EodPhase::Normal;
     }
     let now = Utc::now().with_timezone(&Seoul);
     let mins = now.hour() * 60 + now.minute();
-    if mins >= 15 * 60 + 10 {
+    if (15 * 60 + 10..16 * 60).contains(&mins) {
         EodPhase::Flatten
     } else if mins >= 15 * 60 + 5 {
-        EodPhase::NoEntry
+        EodPhase::NoEntry // 마감 임박 이후 ~ 자정까지 신규 진입 없음
     } else {
         EodPhase::Normal
     }
@@ -948,12 +1011,26 @@ async fn scan_and_trade(deps: &Deps, state: &Arc<Mutex<State>>, token: &str) -> 
         let bar_ts = candle_unix_ts(&closed[closed.len() - 1]);
         let live_ts = candle_unix_ts(candles.last().unwrap());
 
+        // 봉 신선도 가드: 마지막 닫힌 봉이 너무 오래됐으면(장 마감 후·휴장일·피드
+        // 장애) 그 봉의 종가는 지금 체결 가능한 가격이 아니다. 진입/청산/스탑을
+        // 모두 건너뛰고 다음 사이클에 재평가한다 — `last_bar_ts` 도 갱신하지 않아
+        // 신선한 봉이 돌아오면 정상적으로 새 봉으로 인식된다.
+        let bar_age = kst_wallclock_unix() - bar_ts;
+        if bar_age > stale_after_secs(tf) {
+            let mut s = state.lock().await;
+            s.record_monitor(&code, bar_price, live_price, atr, Eval::new(
+                "데이터정지",
+                format!("마지막 마감봉이 {}분 전 — 장외/휴장/피드지연으로 판단 보류", bar_age / 60),
+            ));
+            continue;
+        }
+
         let holds = { state.lock().await.risk.position(&code).is_some() };
         // The intrabar hard stop advertises "실시간가" — but the candle cache can
         // be up to its TTL stale (35–90s). For held positions with the hard stop
         // armed, pull the true current price (t1101) so a crash is caught now.
         if holds {
-            let hard = { state.lock().await.risk.cfg.hard_stop_intrabar };
+            let hard = { state.lock().await.risk_for(&code).hard_stop_intrabar };
             if hard {
                 if let Some(p) = fresh_price(deps, token, &code).await {
                     live_price = p;
@@ -1091,13 +1168,15 @@ async fn manage_open(
     bar_ts: i64,
 ) {
     let new_bar = new_bars > 0;
+    // Exits obey the *symbol's* strategy: a v2 position keeps its ATR stop and
+    // intrabar evaluation even if the operator's form still holds legacy values.
     let (cfg, held_bars) = {
         let mut s = state.lock().await;
         if new_bar {
             let h = s.bars_held.get(code).copied().unwrap_or(0) + new_bars;
             s.bars_held.insert(code.to_string(), h);
         }
-        (s.risk.cfg.clone(), s.bars_held.get(code).copied().unwrap_or(0))
+        (s.risk_for(code), s.bars_held.get(code).copied().unwrap_or(0))
     };
 
     // Averaging-down is only allowed while the daily loss limit (realized +
@@ -1126,7 +1205,7 @@ async fn manage_open(
     if !new_bar {
         return;
     }
-    let reason = { state.lock().await.risk.check_exit(code, bar_price, atr) };
+    let reason = { state.lock().await.risk.check_exit_with(code, bar_price, atr, &cfg) };
     let Some(reason) = reason else { return };
     // min_hold: defer only *trailing* exits. Stops must always fire, and a hit
     // profit target is banked immediately — deferring it just hands the gain
@@ -1170,7 +1249,8 @@ async fn fib_average_down(deps: &Deps, state: &Arc<Mutex<State>>, token: &str, c
     let added = fill.qty.min(add_qty); // 지정가 부분 체결 대비
     let mut s = state.lock().await;
     s.cash -= added as f64 * fill.fill_price;
-    let pos = s.risk.average_down(code, fill.fill_price, added, atr);
+    let eff = s.risk_for(code);
+    let pos = s.risk.average_down(code, fill.fill_price, added, atr, &eff);
     let lvl = pos.as_ref().map_or(0, |p| p.fib_level);
     s.persist(deps.broker.mode);
     s.append_event(json!({
@@ -1208,10 +1288,7 @@ async fn exit(deps: &Deps, state: &Arc<Mutex<State>>, token: &str, code: &str, p
         s.closing.insert(code.to_string());
         (pos, sell_qty, s.order.order_type.clone())
     };
-    let fill = match pos.side {
-        Side::Long => deps.broker.sell(token, code, sell_qty, price, &order_type).await,
-        Side::Short => deps.broker.cover(token, code, sell_qty, price, &order_type).await,
-    };
+    let fill = deps.broker.sell(token, code, sell_qty, price, &order_type).await;
     if !fill.ok || fill.qty <= 0 {
         state.lock().await.closing.remove(code);
         return; // 미체결/실패 — 포지션 유지, 다음 사이클에 청산 조건 재평가
@@ -1220,18 +1297,14 @@ async fn exit(deps: &Deps, state: &Arc<Mutex<State>>, token: &str, code: &str, p
     let sold = fill.qty.min(sell_qty);
     let mut s = state.lock().await;
     s.closing.remove(code);
-    let dir = if pos.side == Side::Short { -1.0 } else { 1.0 };
-    let pnl = (fill.fill_price - pos.entry) * sold as f64 * dir;
-    match pos.side {
-        Side::Long => s.cash += sold as f64 * fill.fill_price,
-        Side::Short => s.cash += pnl, // short open credited no cash; realize P&L on cover
-    }
-    let pnl_pct = if pos.entry != 0.0 { (fill.fill_price - pos.entry) / pos.entry * 100.0 * dir } else { 0.0 };
+    let pnl = (fill.fill_price - pos.entry) * sold as f64;
+    s.cash += sold as f64 * fill.fill_price;
+    let pnl_pct = if pos.entry != 0.0 { (fill.fill_price - pos.entry) / pos.entry * 100.0 } else { 0.0 };
     let closed = s.risk.reduce(code, sold, pnl);
     record_close(deps, &mut s, code, &pos, fill.fill_price, reason, sold, closed);
     s.append_event(json!({
-        "code": code, "name": name_for(code), "side": pos.side.as_str(),
-        "type": if pos.side == Side::Short { "buy" } else { "sell" }, "action": "close",
+        "code": code, "name": name_for(code),
+        "type": "sell", "action": "close",
         "price": fill.fill_price,
         "qty": sold, "pnl": pnl.round(), "pnl_pct": (pnl_pct * 100.0).round() / 100.0,
         "reason": reason, "ts": candle_ts, "time_label": hhmm_label(),
@@ -1286,7 +1359,7 @@ async fn try_enter(
 ) -> Eval {
     let (cfg, strategy) = {
         let s = state.lock().await;
-        (s.risk.cfg.clone(), s.strategy_for(code))
+        (s.risk_for(code), s.strategy_for(code))
     };
 
     // Re-buy price guard — don't buy back at/above the stop-out price. The
@@ -1331,26 +1404,18 @@ async fn try_enter(
     {
         let ctx = SessionContext::for_tf(closed, tf);
         let series = SetupSeries::compute(closed);
-        // Only generate bearish setups when the broker can actually execute a
-        // short — otherwise they'd just occupy the candidate pool and possibly
-        // outscore a real, executable bullish signal for nothing.
-        let allow_short = strategy.allows_short() && deps.broker.supports_short();
         for k in 0..scan_window.min(closed.len()) {
             let i = closed.len() - 1 - k;
-            let mut setups = detect_setups(closed, i, &ctx, &series, &strategy.enabled_patterns, allow_short);
+            let mut setups = detect_setups(closed, i, &ctx, &series, &strategy.enabled_patterns);
+            setups.extend(detect_v2_setups(closed, i, &ctx, &series, &strategy.enabled_patterns));
             for s in &mut setups {
                 apply_strategy(s, &strategy, false, false, false);
             }
             candidates.append(&mut setups);
         }
     }
-    // Keep enabled candidates whose direction the strategy *and* the broker permit
-    // (paper mirrors live: neither can execute a new short — see `Broker::supports_short`).
-    candidates.retain(|r| {
-        strategy.enabled_patterns.contains(&r.pattern_name)
-            && ((r.pattern_type == "bullish" && strategy.allows_long())
-                || (r.pattern_type == "bearish" && strategy.allows_short() && deps.broker.supports_short()))
-    });
+    // Keep only the patterns this strategy has enabled.
+    candidates.retain(|r| strategy.enabled_patterns.contains(&r.pattern_name));
     candidates.sort_by(|a, b| b.composite_score.partial_cmp(&a.composite_score).unwrap_or(std::cmp::Ordering::Equal));
     if candidates.is_empty() {
         return Eval::new("신호없음", "매매 패턴 미감지");
@@ -1364,19 +1429,17 @@ async fn try_enter(
     let last_idx = closed.len() - 1;
     let new_cut = closed.len() - win_missed.min(closed.len()); // indexes >= new_cut are new
     let mut pending: Option<(f64, String)> = None; // best new-but-unconfirmed signal
-    let mut chosen: Option<(PatternResult, Side)> = None;
+    let mut chosen: Option<PatternResult> = None;
     for cand in candidates {
-        let side = Side::from_pattern_type(&cand.pattern_type);
         let Some(pi) = pattern_bar_index(closed, &cand) else { continue };
         if !cfg.require_confirmation {
             if pi >= new_cut {
-                chosen = Some((cand, side));
+                chosen = Some(cand);
                 break;
             }
             continue;
         }
         let p_high = cand.candles_used.iter().map(|c| c.high).fold(f64::MIN, f64::max);
-        let p_low = cand.candles_used.iter().map(|c| c.low).fold(f64::MAX, f64::min);
         let p_close = cand.candles_used.last().map(|c| c.close).unwrap_or(0.0);
         let hi = (pi + confirm_win).min(last_idx);
         let confirmed = (pi + 1..=hi).any(|j| {
@@ -1384,13 +1447,10 @@ async fn try_enter(
                 return false; // this confirmation already fired in a past cycle
             }
             let b = &closed[j];
-            match side {
-                Side::Long => b.close > p_high || (b.is_bull() && b.close > p_close),
-                Side::Short => b.close < p_low || (b.is_bear() && b.close < p_close),
-            }
+            b.close > p_high || (b.is_bull() && b.close > p_close)
         });
         if confirmed {
-            chosen = Some((cand, side));
+            chosen = Some(cand);
             break;
         }
         if pending.is_none() && pi + confirm_win > last_idx {
@@ -1398,17 +1458,46 @@ async fn try_enter(
             pending = Some((cand.composite_score, cand.pattern_name.clone()));
         }
     }
-    let Some((mut top, side)) = chosen else {
+    let Some(mut top) = chosen else {
         return match pending {
             Some((score, name)) => Eval::with_signal(
                 "확인봉대기", format!("{name} 감지 · 확인봉 대기 (패턴 후 {confirm_win}봉 내)"), score, &name),
             None => Eval::new("신호없음", "매매 패턴 미감지 (새 봉 기준)"),
         };
     };
-    // Defensive fallback — candidates are already filtered above, so this
-    // should be unreachable, but keep it in case that filter is ever bypassed.
-    if side == Side::Short && !deps.broker.supports_short() {
-        return Eval::with_signal("숏차단", format!("{} 감지 · 공매도 미지원(모의·실전 공통)", top.pattern_name), top.composite_score, &top.pattern_name);
+
+    // Market-context filter (v2 strategies) — the broad market must be risk-on
+    // and the symbol must be leading it. Nothing in the legacy path looked at
+    // the market at all, which is how a rising index still produced losses:
+    // entries kept landing in names lagging that rise.
+    if strategy.market_filter.enabled {
+        let mf = &strategy.market_filter;
+        let mkt = market::assess(&deps.fetcher, token, &mf.proxy_code, tf, mf.rs_lookback).await;
+        {
+            let mut s = state.lock().await;
+            s.market = Some(mkt.clone());
+        }
+        if mf.require_risk_on && !mkt.risk_on {
+            let why = if mkt.above_ema { "EMA20 하락 전환" } else { "EMA20 이탈" };
+            return Eval::with_signal(
+                "시장위험",
+                format!("{} 감지 · 시장({}) 리스크오프 — {why}", top.pattern_name, mf.proxy_code),
+                top.composite_score,
+                &top.pattern_name,
+            );
+        }
+        let rs = market::relative_strength(closed, &mkt, mf.rs_lookback);
+        if rs < mf.min_rs {
+            return Eval::with_signal(
+                "상대약세",
+                format!(
+                    "{} 감지 · 시장 대비 {rs:+.2}%p (기준 {:+.2}%p) — 주도주 아님",
+                    top.pattern_name, mf.min_rs
+                ),
+                top.composite_score,
+                &top.pattern_name,
+            );
+        }
     }
 
     // Higher-TF trend filter — block trades fighting the upper timeframe.
@@ -1416,13 +1505,8 @@ async fn try_enter(
     // downtrend" instead of any negative drift.
     if cfg.require_higher_tf_uptrend {
         let mtf = MtfEngine::new(&deps.fetcher, &deps.detector);
-        let up = mtf.higher_tf_uptrend(token, code, tf, cfg.higher_tf_slope_tolerance).await;
-        let blocked = match side {
-            Side::Long => !up,
-            Side::Short => up,
-        };
-        if blocked {
-            tracing::info!("entry blocked {code}: higher_tf against {}", side.as_str());
+        if !mtf.higher_tf_uptrend(token, code, tf, cfg.higher_tf_slope_tolerance).await {
+            tracing::info!("entry blocked {code}: higher_tf downtrend");
             return Eval::with_signal("상위TF역행", format!("{} 감지 · 상위 TF 역행으로 진입 차단", top.pattern_name), top.composite_score, &top.pattern_name);
         }
     }
@@ -1430,7 +1514,7 @@ async fn try_enter(
     // MTF confluence score → recompute composite.
     {
         let mtf = MtfEngine::new(&deps.fetcher, &deps.detector);
-        top.mtf_score = mtf.score(token, code, tf, &top.pattern_type).await;
+        top.mtf_score = mtf.score(token, code, tf).await;
         apply_strategy(&mut top, &strategy, true, false, false);
     }
 
@@ -1442,7 +1526,7 @@ async fn try_enter(
     }
     let (can, why) = {
         let s = state.lock().await;
-        let (c, w) = s.risk.can_enter(equity);
+        let (c, w) = s.risk.can_enter_with(equity, &cfg);
         (c, w.to_string())
     };
     if !can {
@@ -1468,7 +1552,7 @@ async fn try_enter(
     // amount (total entered across all positions, not just this order) and cash.
     let (mut qty, order_type, max_buy, cash, entered) = {
         let s = state.lock().await;
-        let q = s.order.fixed_qty.unwrap_or_else(|| s.risk.position_size(equity, price, atr));
+        let q = s.order.fixed_qty.unwrap_or_else(|| s.risk.position_size_with(equity, price, atr, &cfg));
         (q, s.order.order_type.clone(), s.order.max_buy_amount, s.cash, s.risk.total_entered_amount())
     };
     if max_buy > 0.0 && price > 0.0 {
@@ -1481,40 +1565,34 @@ async fn try_enter(
     if qty <= 0 {
         return Eval::with_signal("수량부족", format!("{} 감지 · 가용현금/한도로 매수수량 0", top.pattern_name), top.composite_score, &top.pattern_name);
     }
-    let fill = match side {
-        Side::Long => deps.broker.buy(token, code, qty, price, &order_type).await,
-        Side::Short => deps.broker.sell_short(token, code, qty, price, &order_type).await,
-    };
+    let fill = deps.broker.buy(token, code, qty, price, &order_type).await;
     if !fill.ok || fill.qty <= 0 {
         return Eval::with_signal("주문실패", format!("{} 진입 주문 실패(미체결)", top.pattern_name), top.composite_score, &top.pattern_name);
     }
     let filled = fill.qty.min(qty); // 지정가 부분 체결 대비: 실제 체결수량만 등록
     let mut s = state.lock().await;
-    if side == Side::Long {
-        s.cash -= filled as f64 * fill.fill_price; // short opens credit/use no cash in the paper sim
-    }
-    let (stop, target) = s.risk.stop_and_target(fill.fill_price, atr, side);
-    s.risk.register(code, side, fill.fill_price, filled, stop, target);
+    s.cash -= filled as f64 * fill.fill_price;
+    let (stop, target) = s.risk.stop_and_target_with(fill.fill_price, atr, &cfg);
+    s.risk.register(code, fill.fill_price, filled, stop, target);
     s.opened_meta.insert(code.to_string(), (now_iso(), top.pattern_name.clone()));
     s.bars_held.insert(code.to_string(), 0);
     s.last_exit_price.remove(code);
     s.persist(deps.broker.mode);
-    let action_label = if side == Side::Short { "매도(숏)" } else { "매수" };
     s.append_event(json!({
-        "code": code, "name": name_for(code), "side": side.as_str(),
-        "type": if side == Side::Short { "sell" } else { "buy" }, "action": "open",
+        "code": code, "name": name_for(code),
+        "type": "buy", "action": "open",
         "price": fill.fill_price,
         "qty": filled, "pnl": 0.0, "pnl_pct": 0.0, "reason": top.pattern_name,
         "ts": candle_ts, "time_label": hhmm_label(),
     }));
-    tracing::info!("ENTER {} {code} x{filled} @{:.0} stop={:.0} target={:.0} ({} {:.2})",
-        side.as_str(), fill.fill_price, stop, target, top.pattern_name, top.composite_score);
+    tracing::info!("ENTER {code} x{filled} @{:.0} stop={:.0} target={:.0} ({} {:.2})",
+        fill.fill_price, stop, target, top.pattern_name, top.composite_score);
     notify(deps, format!(
-        "🟢 [{}] 진입 — {}({code}) {} {filled}주 @{:.0}\n{} · 점수 {:.2} · 손절 {:.0} · 익절 {:.0}",
-        mode_label(deps.broker.mode), name_for(code), action_label, fill.fill_price,
+        "🟢 [{}] 진입 — {}({code}) 매수 {filled}주 @{:.0}\n{} · 점수 {:.2} · 손절 {:.0} · 익절 {:.0}",
+        mode_label(deps.broker.mode), name_for(code), fill.fill_price,
         top.pattern_name, top.composite_score, stop, target
     ));
-    Eval::with_signal("진입", format!("{} {action_label} {filled}주 @{:.0}", top.pattern_name, fill.fill_price), top.composite_score, &top.pattern_name)
+    Eval::with_signal("진입", format!("{} 매수 {filled}주 @{:.0}", top.pattern_name, fill.fill_price), top.composite_score, &top.pattern_name)
 }
 
 /// Cost/noise entry gates (composite threshold + volume + reward/risk + edge-over-cost).
@@ -1559,21 +1637,70 @@ fn record_close(deps: &Deps, s: &mut State, code: &str, pos: &crate::risk::Posit
         s.opened_meta.get(code).cloned()
     };
     let (opened_at, pattern) = meta.unwrap_or_default();
-    // Direction-aware P&L: a short profits when the exit is *below* the entry.
-    let dir = if pos.side == Side::Short { -1.0 } else { 1.0 };
-    let ret_pct = if pos.entry != 0.0 { (exit_price - pos.entry) / pos.entry * 100.0 * dir } else { 0.0 };
+    let ret_pct = if pos.entry != 0.0 { (exit_price - pos.entry) / pos.entry * 100.0 } else { 0.0 };
     deps.journal.record(&TradeRecord {
         mode: deps.broker.mode.as_str().to_string(),
         code: code.to_string(),
-        side: pos.side.as_str().to_string(),
         qty,
         entry: pos.entry,
         exit: exit_price,
-        pnl: (exit_price - pos.entry) * qty as f64 * dir,
+        pnl: (exit_price - pos.entry) * qty as f64,
         return_pct: ret_pct,
         reason: reason.to_string(),
         pattern,
         opened_at,
         closed_at: now_iso(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_guard_tolerates_normal_bar_lag_but_catches_session_gaps() {
+        // 10분봉: 정상 지연(마감 직후 ~ 다음 봉 형성 중)은 통과해야 한다.
+        let limit = stale_after_secs(Timeframe::M10);
+        assert!(limit > tf_secs(Timeframe::M10) * 2, "정상 봉 지연을 오탐하면 안 된다");
+        // 하지만 하룻밤(17시간)은 반드시 걸러야 한다.
+        assert!(17 * 3600 > limit, "장 마감 후 스테일 봉은 차단되어야 한다");
+        // 1분봉도 마찬가지 — 주말(2일)은 확실히 차단.
+        assert!(2 * 86_400 > stale_after_secs(Timeframe::M1));
+    }
+
+    #[test]
+    fn daily_timeframe_survives_a_weekend() {
+        // 일봉은 금요일 봉을 월요일에 평가해도 유효해야 한다 (3일 경과).
+        assert!(stale_after_secs(Timeframe::D1) > 3 * 86_400);
+    }
+
+    #[test]
+    fn snapshot_roundtrips_last_bar_ts() {
+        // 재시작 후 이미 처리한 봉을 다시 거래하지 않으려면 왕복 보존이 필수.
+        let snap = Snapshot {
+            day: "2026-08-04".into(),
+            cash: 1.0,
+            seed_cash: 1.0,
+            daily_pnl: 0.0,
+            day_start_equity: 1.0,
+            positions: HashMap::new(),
+            opened_meta: HashMap::new(),
+            cooldown: HashMap::new(),
+            last_exit_price: HashMap::new(),
+            bars_held: HashMap::new(),
+            last_bar_ts: HashMap::from([("005930".to_string(), 1_754_000_000i64)]),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: Snapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.last_bar_ts.get("005930"), Some(&1_754_000_000));
+    }
+
+    #[test]
+    fn legacy_snapshot_without_last_bar_ts_still_loads() {
+        let legacy = r#"{"day":"2026-08-04","cash":1.0,"seed_cash":1.0,"daily_pnl":0.0,
+            "day_start_equity":1.0,"positions":{},"opened_meta":{},"cooldown":{},
+            "last_exit_price":{},"bars_held":{}}"#;
+        let snap: Snapshot = serde_json::from_str(legacy).expect("구버전 스냅샷 호환");
+        assert!(snap.last_bar_ts.is_empty());
+    }
 }

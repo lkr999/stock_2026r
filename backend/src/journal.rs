@@ -14,9 +14,6 @@ use std::sync::Mutex;
 pub struct TradeRecord {
     pub mode: String, // "paper" | "live"
     pub code: String,
-    /// "long" | "short" — P&L in this record is direction-aware.
-    #[serde(default)]
-    pub side: String,
     pub qty: i64,
     pub entry: f64,
     pub exit: f64,

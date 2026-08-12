@@ -13,6 +13,7 @@ mod ebest;
 mod engine;
 mod indicators;
 mod journal;
+mod market;
 mod mtf;
 mod pattern;
 mod risk;

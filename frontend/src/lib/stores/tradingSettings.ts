@@ -6,6 +6,8 @@ const KEY = 'tradingSettings';
 export interface TradingSettings {
   mode: string;
   strategy: string;
+  /** 전략 세대 — 'v2'(신형: 리스크·시장필터 포함) | 'legacy'(기존: 진입신호만). */
+  generation: 'v2' | 'legacy';
   tf: string;
   watchlistText: string;
   pollSec: number;

@@ -8,7 +8,7 @@
 <table>
   <thead>
     <tr>
-      <th></th><th>종목</th><th>현재가</th><th>등락</th><th>패턴</th><th>방향</th>
+      <th></th><th>종목</th><th>현재가</th><th>등락</th><th>패턴</th>
       <th>신뢰도</th><th>종합</th><th>확인</th>
       <th title="Caginalp-Laurent(1998) 미국 일봉 논문값 — 실제 측정값 아님. 실측은 백테스트 참고">참고기대(논문)</th><th></th>
     </tr>
@@ -24,7 +24,6 @@
         <td class="num">{(s.price ?? 0).toLocaleString()}</td>
         <td class="num {(s.change_pct ?? 0) >= 0 ? 'up' : 'down'}">{(s.change_pct ?? 0) >= 0 ? '+' : ''}{s.change_pct ?? 0}%</td>
         <td>{s.pattern_name}</td>
-        <td class={s.pattern_type}>{s.pattern_type === 'bullish' ? '▲ 상승' : '▼ 하락'}</td>
         <td class="num">{Math.round(s.confidence * 100)}%</td>
         <td><span class="score" class:hi={s.composite_score >= 0.7}>{Math.round(s.composite_score * 100)}%</span></td>
         <td class="conf">
@@ -37,7 +36,7 @@
       </tr>
     {/each}
     {#if signals.length === 0}
-      <tr><td colspan="11" class="empty">
+      <tr><td colspan="10" class="empty">
         {#if loading}종목 스캔 중… (종목당 약 1초 · eBest 호출 한도)
         {:else}신호 없음 — 타임프레임/전략/가격범위를 바꿔보세요{/if}
       </td></tr>
@@ -54,8 +53,6 @@
   .code { color: #a6adc8; margin-left: 6px; font-size: 11px; }
   .up { color: #ef4444; }
   .down { color: #3b82f6; }
-  .bullish { color: #ef4444; }
-  .bearish { color: #3b82f6; }
   .score { padding: 2px 6px; border-radius: 4px; background: #313244; }
   .score.hi { background: #a6e3a1; color: #1e1e2e; font-weight: 700; }
   .conf .b { font-size: 10px; background: #313244; padding: 1px 5px; border-radius: 8px; margin-right: 3px; }

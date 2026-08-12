@@ -104,9 +104,7 @@
       const pnlText = ev.pnl !== 0
         ? ` (${ev.pnl >= 0 ? '+' : ''}${Math.round(ev.pnl).toLocaleString()}원 ${ev.pnl_pct >= 0 ? '+' : ''}${ev.pnl_pct.toFixed(1)}%)`
         : '';
-      const label = ev.side === 'short'
-        ? (ev.action === 'close' ? '숏청산' : '숏진입')
-        : (ev.action === 'close' ? '매도' : isBuy ? '매수' : '매도');
+      const label = isBuy ? '매수' : '매도';
       markers.push({
         time: markerTs as any,
         position: isBuy ? 'belowBar' : 'aboveBar',

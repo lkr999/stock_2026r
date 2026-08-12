@@ -16,8 +16,8 @@ impl<'a> MtfEngine<'a> {
         Self { fetcher, detector }
     }
 
-    /// Fraction of upper timeframes that show a same-direction signal (0.5 if none).
-    pub async fn score(&self, token: &str, shcode: &str, base_tf: Timeframe, pattern_type: &str) -> f64 {
+    /// Fraction of upper timeframes that also show a bullish signal (0.5 if none).
+    pub async fn score(&self, token: &str, shcode: &str, base_tf: Timeframe) -> f64 {
         let uppers = base_tf.mtf_group();
         if uppers.is_empty() {
             return 0.5; // neutral when no higher timeframe exists
@@ -29,15 +29,14 @@ impl<'a> MtfEngine<'a> {
             // Judge on closed bars only — the last bar is still forming and its
             // shape can flip before the close.
             let closed = if candles.is_empty() { &candles[..] } else { &candles[..candles.len() - 1] };
-            let results = self.detector.scan(closed, *tf, 0.5, true, &default_cfg, 1);
-            if results.iter().any(|r| r.pattern_type == pattern_type) {
+            if !self.detector.scan(closed, *tf, 0.5, true, &default_cfg, 1).is_empty() {
                 hits += 1;
             }
         }
         hits as f64 / uppers.len() as f64
     }
 
-    /// True unless the nearest higher timeframe is in a downtrend (long-entry gate).
+    /// True unless the nearest higher timeframe is in a downtrend (entry gate).
     ///
     /// `slope_tolerance` relaxes the gate: the trend counts as "not down" while
     /// the per-bar slope, normalized by the mean price, stays above −tolerance

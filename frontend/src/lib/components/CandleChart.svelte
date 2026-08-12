@@ -106,12 +106,11 @@
       .map((p) => {
         const time = tsIndex.get(p.detected_at);
         if (time == null) return null;
-        const bull = p.pattern_type === 'bullish';
         return {
           time,
-          position: bull ? 'belowBar' : 'aboveBar',
-          color: bull ? UP : DOWN,
-          shape: bull ? 'arrowUp' : 'arrowDown',
+          position: 'belowBar',
+          color: UP,
+          shape: 'arrowUp',
           text: `${p.pattern_name} ${Math.round(p.composite_score * 100)}%`
         };
       })

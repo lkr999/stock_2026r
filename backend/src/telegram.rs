@@ -268,13 +268,12 @@ pub fn monitor_section(status: &Value) -> String {
         for p in &positions {
             let name = p.get("name").and_then(Value::as_str).unwrap_or("");
             let code = p.get("code").and_then(Value::as_str).unwrap_or("");
-            let side = side_ko(p.get("side").and_then(Value::as_str).unwrap_or("long"));
             let qty = p.get("qty").and_then(Value::as_i64).unwrap_or(0);
             let cur = p.get("current_price").and_then(Value::as_f64).unwrap_or(0.0);
             let upnl = p.get("unrealized_pnl").and_then(Value::as_f64).unwrap_or(0.0);
             let upct = p.get("unrealized_pct").and_then(Value::as_f64).unwrap_or(0.0);
             out.push_str(&format!(
-                "• {name}({code}) {side} {qty}주 @{} {} ({:+.2}%)\n",
+                "• {name}({code}) {qty}주 @{} {} ({:+.2}%)\n",
                 won(cur),
                 won_signed(upnl),
                 upct,
@@ -303,14 +302,13 @@ pub fn trades_section(trades: &[Value]) -> String {
     } else {
         for t in trades {
             let code = t.get("code").and_then(Value::as_str).unwrap_or("");
-            let side = side_ko(t.get("side").and_then(Value::as_str).unwrap_or("long"));
             let pnl = t.get("pnl").and_then(Value::as_f64).unwrap_or(0.0);
             let ret = t.get("return_pct").and_then(Value::as_f64).unwrap_or(0.0);
             let reason = t.get("reason").and_then(Value::as_str).unwrap_or("");
             let closed = t.get("closed_at").and_then(Value::as_str).unwrap_or("");
             let mark = if pnl > 0.0 { "🔺" } else if pnl < 0.0 { "🔻" } else { "▪️" };
             out.push_str(&format!(
-                "{mark} {} {code} {side} {} ({:+.2}%) {}\n",
+                "{mark} {} {code} {} ({:+.2}%) {}\n",
                 hhmm_kst(closed),
                 won_signed(pnl),
                 ret,
@@ -367,10 +365,6 @@ fn group(n: i64) -> String {
         out.push(c);
     }
     if neg { format!("-{out}") } else { out }
-}
-
-fn side_ko(side: &str) -> &'static str {
-    if side == "short" { "숏" } else { "롱" }
 }
 
 /// RFC3339(UTC) → KST "MM-DD HH:MM". 파싱 실패 시 원문 앞 16자.

@@ -21,6 +21,8 @@ pub struct Stock {
 
 static UNIVERSE: OnceLock<Vec<Stock>> = OnceLock::new();
 static BY_CODE: OnceLock<HashMap<String, Stock>> = OnceLock::new();
+/// CSV 안의 `현재가 업데이트시각` 최댓값 — 이 스냅샷이 언제 것인지.
+static AS_OF: OnceLock<String> = OnceLock::new();
 
 fn num(s: &str) -> f64 {
     s.trim().replace(',', "").parse().unwrap_or(0.0)
@@ -44,12 +46,18 @@ pub fn load() -> &'static Vec<Stock> {
             idx("코드"), idx("종목"), idx("시장"), idx("현재가"),
             idx("전일종가"), idx("등락률"), idx("거래량"),
         );
+        let ui = idx("현재가 업데이트시각");
         let get = |rec: &csv::StringRecord, i: Option<usize>| i.and_then(|i| rec.get(i)).unwrap_or("").to_string();
         let mut rows = vec![];
+        let mut as_of = String::new();
         for rec in rdr.records().flatten() {
             let code = get(&rec, ci).trim().to_string();
             if code.is_empty() {
                 continue;
+            }
+            let stamp = get(&rec, ui).trim().to_string();
+            if stamp > as_of {
+                as_of = stamp;
             }
             rows.push(Stock {
                 name: get(&rec, ni).trim().to_string(),
@@ -61,8 +69,21 @@ pub fn load() -> &'static Vec<Stock> {
                 code,
             });
         }
+        let _ = AS_OF.set(as_of);
         rows
     })
+}
+
+/// 유니버스 스냅샷 시각과 신선도. **이 CSV 는 자동 갱신되지 않는다** —
+/// ①단계 가격 필터는 여기 담긴 *과거* 현재가로 후보를 거르므로, 오래되면
+/// 지금 가격대와 전혀 다른 종목이 후보에 들어온다.
+pub fn snapshot_info() -> (String, i64) {
+    load(); // AS_OF 초기화 보장
+    let as_of = AS_OF.get().cloned().unwrap_or_default();
+    let age_days = chrono::DateTime::parse_from_rfc3339(&as_of)
+        .map(|d| (chrono::Utc::now() - d.with_timezone(&chrono::Utc)).num_days())
+        .unwrap_or(-1);
+    (as_of, age_days)
 }
 
 fn by_code() -> &'static HashMap<String, Stock> {

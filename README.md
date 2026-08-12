@@ -8,8 +8,10 @@ market (KOSPI/KOSDAQ), implementing the spec in
 
 ## What's implemented (Phase 1–2 MVP)
 
-- ✅ **8 rule-based reversal patterns** (Three White Soldiers, Morning/Evening Star,
-  Hammer, Hanging Man, Bullish/Bearish Engulfing, Three Black Crows)
+- ✅ **Long-only by design** — every signal, position, and order is a buy-to-open /
+  sell-to-close. There is no short side anywhere in the engine, backtester, or UI.
+- ✅ **8 rule-based bullish patterns** (Three White Soldiers, Morning Star, Hammer,
+  Bullish Engulfing, Pin Bar, Inside-Bar Breakout, Tweezer Bottom, Marubozu)
 - ✅ **Multi-timeframe** data (1m–1d) via eBest t8412/t8410
 - ✅ **Modern overlays:** ATR-adaptive threshold, volume confirmation, MTF confluence
 - ✅ **Strategy mix/select** — tunable `StrategyConfig` weights + 4 presets

@@ -55,7 +55,7 @@
     {#each patterns as p}
       <div class="pcard">
         <div class="phead">
-          <span class={p.pattern_type}>{p.pattern_type === 'bullish' ? '▲' : '▼'} {p.pattern_name}</span>
+          <span class="bullish">▲ {p.pattern_name}</span>
         </div>
         <CompositeScoreBar
           confidence={p.confidence} mtfScore={p.mtf_score} mlScore={p.ml_score}
@@ -81,7 +81,6 @@
   .pcard { margin-bottom: 14px; }
   .phead { margin-bottom: 6px; font-weight: 600; font-size: 14px; }
   .bullish { color: #a6e3a1; }
-  .bearish { color: #f38ba8; }
   .exp { font-size: 11px; color: #a6adc8; margin-top: 6px; }
   .empty { color: #a6adc8; font-size: 13px; }
   .error { background: #f38ba8; color: #1e1e2e; padding: 10px; border-radius: 6px; margin-bottom: 12px; }

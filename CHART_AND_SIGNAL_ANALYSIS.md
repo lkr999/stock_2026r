@@ -122,32 +122,37 @@ eBest 응답(t8410/t8412)을 `CandleFetcher`가 아래 형태로 정규화하여
 
 ## 3. 패턴 감지 & 신뢰도 계산
 
-### 3-1. 8개 패턴 (Caginalp & Laurent 1998)
+### 3-1. 캔들 패턴 (Caginalp & Laurent 1998 + 단타 보강)
 
-| # | 패턴 | 방향 | 봉수 | 추세 전제 |
-|---|------|------|------|-----------|
-| 1 | three_white_soldiers (삼백병) | 상승 | 3 | 하락추세 후 |
-| 2 | morning_star (샛별형) | 상승 | 3 | 하락추세 후 |
-| 3 | hammer (망치형) | 상승 | 1 | 하락추세 후 |
-| 4 | bullish_engulfing (상승장악) | 상승 | 2 | 하락추세 후 |
-| 5 | three_black_crows (삼흑병) | 하락 | 3 | 상승추세 후 |
-| 6 | evening_star (석별형) | 하락 | 3 | 상승추세 후 |
-| 7 | hanging_man (교수형) | 하락 | 1 | 상승추세 후 |
-| 8 | bearish_engulfing (하락장악) | 하락 | 2 | 상승추세 후 |
+이 시스템은 **매수 전용(롱 전용)** 이다. 하락 반전 패턴(삼흑병·석별형·교수형·하락장악 등)은
+진입 신호가 될 수 없으므로 **탐지기 자체를 두지 않는다**. 감지되는 패턴은 모두 상승 패턴이다.
+
+| # | 패턴 | 봉수 | 추세 전제 |
+|---|------|------|-----------|
+| 1 | three_white_soldiers (삼백병) | 3 | 하락추세 후 |
+| 2 | morning_star (샛별형) | 3 | 하락추세 후 |
+| 3 | hammer (망치형) | 1 | 하락추세 후 |
+| 4 | bullish_engulfing (상승장악) | 2 | 하락추세 후 |
+| 5 | pin_bar_bull (상승 핀바) | 1 | — |
+| 6 | inside_bar_break_up (인사이드바 상향돌파) | 3 | — |
+| 7 | tweezer_bottom (집게바닥) | 2 | 하락추세 후 |
+| 8 | marubozu_bull (양봉 마루보주) | 1 | — |
 
 - **추세 판단**: 패턴 직전 N봉(타임프레임별 `trend_lookback`)의 종가 **선형회귀 기울기** 부호
-  (`_trend_slope`). 상승반전 패턴은 기울기 < 0(하락추세) 필요, 하락반전은 기울기 > 0 필요.
+  (`trend_slope`). 상승반전 패턴은 기울기 < 0(하락추세)일 때만 성립한다.
 
 ### 3-2. 신뢰도(confidence) 계산식 — 패턴별 (모두 0~1 클램핑)
 
 | 패턴 | confidence 공식 |
 |------|-----------------|
 | three_white_soldiers | `min(몸통비율)/0.60×0.5 + (c3종가−c1시가)/평균몸통/3×0.5` |
-| three_black_crows | `min(몸통비율)/0.60×0.6 + 0.4` |
 | morning_star | `recovery×0.6 + c1몸통비율×0.4` (recovery=(c3종가−c2종가)/c1몸통) |
-| evening_star | `decline×0.6 + c1몸통비율×0.4` (decline=(c2시가−c3종가)/c1몸통) |
-| hammer / hanging_man | `(아래꼬리/(몸통×2))×0.7 + 몸통위치×0.3` |
-| bullish / bearish engulfing | `(장악비율−1)×0.5 + 0.5` (장악비율=c2몸통/c1몸통) |
+| hammer | `(아래꼬리/(몸통×2))×0.7 + 몸통위치×0.3` |
+| bullish_engulfing | `(장악비율−1)×0.5 + 0.5` (장악비율=c2몸통/c1몸통) |
+| pin_bar_bull | `min(아래꼬리/전체범위, 1)×0.7 + 0.3` |
+| inside_bar_break_up | `min(0.55 + (돌파종가−모봉고가)/모봉범위×0.45, 1)` |
+| tweezer_bottom | `min(0.6 + c2몸통비율×0.4, 1)` |
+| marubozu_bull | `몸통비율` (≥0.90 일 때만 성립) |
 
 - 몸통비율 = `|종가−시가| / (고가−저가)`
 - 각 패턴은 형태 조건(몸통비율 ≥ 0.6, 갭, 꼬리 길이 등)을 먼저 통과해야 하며,
@@ -230,11 +235,11 @@ signal 값:
 
 → **모든 거래의 최대 손실을 자본의 1%로 고정**, 종목당 비중은 10% 상한.
 
-### 6-3. 기본 거래 대상 패턴 (long_only)
+### 6-3. 기본 거래 대상 패턴 (매수 전용)
 
-기본 `enabled_patterns` = **상승 4종만** (`three_white_soldiers`, `morning_star`,
-`bullish_engulfing`, `hammer`). 하락 패턴은 감지·표시되지만 **기본 전략에서는 매수하지 않음**
-(공매도 미사용 가정). 전략 커스터마이즈로 변경 가능.
+기본 `enabled_patterns` = `three_white_soldiers`, `morning_star`, `bullish_engulfing`,
+`hammer`. 시스템 전체가 매수 전용이라 **방향 설정(direction) 자체가 없으며**, 모든 진입은
+매수·모든 청산은 매도다. 사용할 패턴 목록만 전략별로 커스터마이즈한다.
 
 ---
 

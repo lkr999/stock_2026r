@@ -55,7 +55,7 @@ pub struct RiskConfig {
     /// pattern alive so a slightly late breakout still triggers the entry.
     pub confirm_window_bars: i64,
     pub require_higher_tf_uptrend: bool,
-    /// Relaxation for the higher-TF trend gate: block longs only when the
+    /// Relaxation for the higher-TF trend gate: block entries only when the
     /// higher-TF slope is *below* −tolerance (fraction of price per bar).
     /// 0 = strict legacy behavior (any negative slope blocks).
     pub higher_tf_slope_tolerance: f64,
@@ -153,37 +153,15 @@ impl Default for RiskConfig {
     }
 }
 
-/// Position direction. Shorts are paper-simulation only (KR retail intraday
-/// shorting is effectively unavailable); the live broker rejects short orders.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Side {
-    Long,
-    Short,
-}
-
-impl Side {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Side::Long => "long",
-            Side::Short => "short",
-        }
-    }
-    /// Map a pattern type (`"bullish"` / `"bearish"`) to a trade side.
-    pub fn from_pattern_type(t: &str) -> Self {
-        if t == "bearish" { Side::Short } else { Side::Long }
-    }
-}
-
-/// An open position tracked by the risk manager.
+/// An open position tracked by the risk manager. The system is long-only:
+/// every position is a buy that profits when the price rises.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Position {
-    pub side: Side,
     pub entry: f64,
     pub qty: i64,
     pub stop: f64,
     pub target: f64,
-    pub peak: f64, // best excursion: highest price for longs, lowest for shorts
+    pub peak: f64,     // best excursion: the highest price seen since entry
     pub base_qty: i64, // first-entry size; basis for fib averaging multiples
     pub fib_level: i64,
 }
@@ -213,9 +191,9 @@ impl RiskManager {
         self.daily_pnl
     }
 
-    /// Total notional committed across all open positions (Σ entry×qty, both
-    /// longs and shorts) — what the order-level `max_buy_amount` cap is
-    /// measured against (a portfolio-wide total, not a per-order limit).
+    /// Total notional committed across all open positions (Σ entry×qty) — what
+    /// the order-level `max_buy_amount` cap is measured against (a
+    /// portfolio-wide total, not a per-order limit).
     pub fn total_entered_amount(&self) -> f64 {
         self.positions.values().map(|p| p.entry * p.qty as f64).sum()
     }
@@ -235,100 +213,87 @@ impl RiskManager {
         true
     }
 
-    /// Gate new entries on the daily-loss limit and max open positions.
-    pub fn can_enter(&self, equity: f64) -> (bool, &'static str) {
+    /// Gate new entries on the daily-loss limit and max open positions, judged
+    /// against the entering symbol's *effective* config (its strategy may
+    /// override `max_positions`). The daily-loss limit stays portfolio-wide —
+    /// it is an account rule, not a strategy rule.
+    pub fn can_enter_with(&self, equity: f64, cfg: &RiskConfig) -> (bool, &'static str) {
         if !self.daily_loss_ok(equity) {
             return (false, "daily_loss_limit_reached");
         }
-        if self.positions.len() >= self.cfg.max_positions {
+        if self.positions.len() >= cfg.max_positions {
             return (false, "max_positions_reached");
         }
         (true, "ok")
     }
 
-    /// Position size = min(risk-based qty, position-cap qty).
-    /// Risk-based sizing uses the *actual* stop distance (manual fixed-% when set).
-    pub fn position_size(&self, equity: f64, entry: f64, atr: f64) -> i64 {
-        let (stop_distance, _) = self.cfg.stop_target_dists(entry, atr);
+    /// Position size = min(risk-based qty, position-cap qty), using the *actual*
+    /// stop distance from `cfg` (manual fixed-% when set, else the ATR multiple)
+    /// so a strategy's own stop sizes the trade it will actually place.
+    pub fn position_size_with(&self, equity: f64, entry: f64, atr: f64, cfg: &RiskConfig) -> i64 {
+        let (stop_distance, _) = cfg.stop_target_dists(entry, atr);
         if stop_distance <= 0.0 || entry <= 0.0 {
             return 0;
         }
-        let qty_by_risk = (equity * self.cfg.risk_per_trade_pct / stop_distance) as i64;
-        let qty_by_cap = (equity * self.cfg.max_position_pct / entry) as i64;
+        let qty_by_risk = (equity * cfg.risk_per_trade_pct / stop_distance) as i64;
+        let qty_by_cap = (equity * cfg.max_position_pct / entry) as i64;
         qty_by_risk.min(qty_by_cap).max(0)
     }
 
-    /// (stop, target) around an entry price for the given side.
+    /// (stop, target) around an entry price: stop below, target above.
     /// Manual fixed-% takes priority when set (>0); otherwise falls back to ATR multiples.
-    /// Shorts mirror longs: stop above entry, target below.
-    pub fn stop_and_target(&self, entry: f64, atr: f64, side: Side) -> (f64, f64) {
-        let (stop_dist, target_dist) = self.cfg.stop_target_dists(entry, atr);
-        match side {
-            Side::Long => (entry - stop_dist, entry + target_dist),
-            Side::Short => (entry + stop_dist, entry - target_dist),
-        }
+    pub fn stop_and_target_with(&self, entry: f64, atr: f64, cfg: &RiskConfig) -> (f64, f64) {
+        let (stop_dist, target_dist) = cfg.stop_target_dists(entry, atr);
+        (entry - stop_dist, entry + target_dist)
     }
 
-    pub fn register(&mut self, code: &str, side: Side, entry: f64, qty: i64, stop: f64, target: f64) {
+    pub fn register(&mut self, code: &str, entry: f64, qty: i64, stop: f64, target: f64) {
         self.positions.insert(
             code.to_string(),
-            Position { side, entry, qty, stop, target, peak: entry, base_qty: qty, fib_level: 0 },
+            Position { entry, qty, stop, target, peak: entry, base_qty: qty, fib_level: 0 },
         );
     }
 
     /// Decide whether to exit: returns stop_loss / take_profit / trailing_stop / None.
-    /// Comparisons are direction-aware (shorts mirror longs).
-    pub fn check_exit(&mut self, code: &str, price: f64, atr: f64) -> Option<&'static str> {
-        let (use_sl, use_tp, use_trail) =
-            (self.cfg.use_stop_loss, self.cfg.use_take_profit, self.cfg.use_trailing_stop);
+    ///
+    /// `cfg` is the position's *effective* risk config, so each position is
+    /// managed by the exit rules of the strategy that opened it — a v2 runner
+    /// must not be cut short by whatever take-profit the form happens to hold.
+    pub fn check_exit_with(
+        &mut self,
+        code: &str,
+        price: f64,
+        atr: f64,
+        cfg: &RiskConfig,
+    ) -> Option<&'static str> {
+        let (use_sl, use_tp, use_trail) = (cfg.use_stop_loss, cfg.use_take_profit, cfg.use_trailing_stop);
         let pos = self.positions.get_mut(code)?;
-        match pos.side {
-            Side::Long => {
-                pos.peak = pos.peak.max(price);
-                let trail = pos.peak - atr * self.cfg.trailing_stop_atr;
-                if use_sl && price <= pos.stop {
-                    Some("stop_loss")
-                } else if use_tp && price >= pos.target {
-                    Some("take_profit")
-                } else if use_trail && price <= trail && price > pos.entry {
-                    Some("trailing_stop")
-                } else {
-                    None
-                }
-            }
-            Side::Short => {
-                pos.peak = pos.peak.min(price);
-                let trail = pos.peak + atr * self.cfg.trailing_stop_atr;
-                if use_sl && price >= pos.stop {
-                    Some("stop_loss")
-                } else if use_tp && price <= pos.target {
-                    Some("take_profit")
-                } else if use_trail && price >= trail && price < pos.entry {
-                    Some("trailing_stop")
-                } else {
-                    None
-                }
-            }
+        pos.peak = pos.peak.max(price);
+        let trail = pos.peak - atr * cfg.trailing_stop_atr;
+        if use_sl && price <= pos.stop {
+            Some("stop_loss")
+        } else if use_tp && price >= pos.target {
+            Some("take_profit")
+        } else if use_trail && price <= trail && price > pos.entry {
+            Some("trailing_stop")
+        } else {
+            None
         }
     }
 
-    /// Intrabar protection: live price beyond stop × (1 ∓ buffer)?
+    /// Intrabar protection: live price below stop × (1 − buffer)?
     pub fn hard_stop_hit(&self, code: &str, price: f64, buffer_pct: f64) -> bool {
-        self.positions.get(code).is_some_and(|p| match p.side {
-            Side::Long => price <= p.stop * (1.0 - buffer_pct),
-            Side::Short => price >= p.stop * (1.0 + buffer_pct),
-        })
+        self.positions.get(code).is_some_and(|p| price <= p.stop * (1.0 - buffer_pct))
     }
 
     /// Whether another averaging-down level is available (feature on + level free).
-    /// Averaging-down is a long-only concept, so shorts never qualify.
     pub fn can_average(&self, code: &str) -> bool {
         if !self.cfg.fib_averaging_enabled || self.cfg.fib_max_levels <= 0 {
             return false;
         }
         self.positions
             .get(code)
-            .is_some_and(|p| p.side == Side::Long && p.fib_level < self.cfg.fib_max_levels)
+            .is_some_and(|p| p.fib_level < self.cfg.fib_max_levels)
     }
 
     /// Quantity to buy at the next averaging level = base_qty × fib(level+1).
@@ -339,25 +304,30 @@ impl RiskManager {
     }
 
     /// Add to a position, lower the average entry, and reset stop/target.
-    pub fn average_down(&mut self, code: &str, add_price: f64, add_qty: i64, atr: f64) -> Option<Position> {
+    /// `cfg` is the position's *effective* risk config, so the reset stop keeps
+    /// using the strategy's own multiples.
+    pub fn average_down(
+        &mut self,
+        code: &str,
+        add_price: f64,
+        add_qty: i64,
+        atr: f64,
+        cfg: &RiskConfig,
+    ) -> Option<Position> {
         let (stop, target);
         {
             let pos = self.positions.get(code)?;
             if add_qty <= 0 {
                 return None;
             }
-            let side = pos.side;
             let new_qty = pos.qty + add_qty;
             let new_entry = (pos.entry * pos.qty as f64 + add_price * add_qty as f64) / new_qty as f64;
-            (stop, target) = self.stop_and_target(new_entry, atr, side);
+            (stop, target) = self.stop_and_target_with(new_entry, atr, cfg);
             let pos = self.positions.get_mut(code).unwrap();
             pos.entry = new_entry;
             pos.qty = new_qty;
             pos.fib_level += 1;
-            pos.peak = match side {
-                Side::Long => add_price.max(new_entry),
-                Side::Short => add_price.min(new_entry),
-            };
+            pos.peak = add_price.max(new_entry);
             pos.stop = stop;
             pos.target = target;
         }
@@ -434,27 +404,38 @@ mod tests {
     }
 
     #[test]
-    fn short_stop_target_mirror_long() {
+    fn stop_below_and_target_above_entry() {
         let m = mgr();
-        let (ls, lt) = m.stop_and_target(100.0, 5.0, Side::Long);
-        let (ss, st) = m.stop_and_target(100.0, 5.0, Side::Short);
-        assert_eq!((ls, lt), (95.0, 110.0));
-        assert_eq!((ss, st), (105.0, 90.0)); // stop above, target below
+        assert_eq!(m.stop_and_target_with(100.0, 5.0, &m.cfg), (95.0, 110.0));
     }
 
     #[test]
-    fn short_exit_hits_stop_above_entry() {
+    fn exit_hits_stop_below_entry() {
         let mut m = mgr();
-        m.register("X", Side::Short, 100.0, 10, 105.0, 90.0);
-        assert_eq!(m.check_exit("X", 101.0, 5.0), None);
-        assert_eq!(m.check_exit("X", 106.0, 5.0), Some("stop_loss")); // price rose into stop
+        let cfg = m.cfg.clone();
+        m.register("X", 100.0, 10, 95.0, 110.0);
+        assert_eq!(m.check_exit_with("X", 99.0, 5.0, &cfg), None);
+        assert_eq!(m.check_exit_with("X", 94.0, 5.0, &cfg), Some("stop_loss"));
     }
 
     #[test]
-    fn short_exit_hits_target_below_entry() {
+    fn exit_hits_target_above_entry() {
         let mut m = mgr();
-        m.register("X", Side::Short, 100.0, 10, 105.0, 90.0);
-        assert_eq!(m.check_exit("X", 89.0, 5.0), Some("take_profit"));
+        let cfg = m.cfg.clone();
+        m.register("X", 100.0, 10, 95.0, 110.0);
+        assert_eq!(m.check_exit_with("X", 111.0, 5.0, &cfg), Some("take_profit"));
+    }
+
+    /// A position opened by a v2 runner keeps its own exit rules even when the
+    /// manager's base config still says "take profit at 2×ATR".
+    #[test]
+    fn per_position_config_governs_the_exit() {
+        let mut m = mgr(); // base: take-profit ON at 110
+        m.register("X", 100.0, 10, 95.0, 110.0);
+        let runner = RiskConfig { use_take_profit: false, ..m.cfg.clone() };
+        assert_eq!(m.check_exit_with("X", 111.0, 5.0, &runner), None);
+        // …but its stop still fires.
+        assert_eq!(m.check_exit_with("X", 94.0, 5.0, &runner), Some("stop_loss"));
     }
 
     #[test]
@@ -465,28 +446,29 @@ mod tests {
             ..Default::default()
         });
         // Manual 3%/6% beats the ATR multiples.
-        let (stop, target) = m.stop_and_target(100.0, 5.0, Side::Long);
+        let (stop, target) = m.stop_and_target_with(100.0, 5.0, &m.cfg);
         assert_eq!((stop, target), (97.0, 106.0));
         // Sizing uses the same manual stop distance: risk 1% of 1M = 10,000원,
         // stop 3원 → 3333주, capped by 10% position cap → 1000주.
-        assert_eq!(m.position_size(1_000_000.0, 100.0, 5.0), 1000);
+        assert_eq!(m.position_size_with(1_000_000.0, 100.0, 5.0, &m.cfg), 1000);
     }
 
     #[test]
-    fn total_entered_amount_sums_both_sides() {
+    fn total_entered_amount_sums_all_positions() {
         let mut m = mgr();
         assert_eq!(m.total_entered_amount(), 0.0);
-        m.register("L", Side::Long, 100.0, 10, 95.0, 110.0); // 1,000
-        m.register("S", Side::Short, 200.0, 5, 210.0, 180.0); // 1,000
+        m.register("A", 100.0, 10, 95.0, 110.0); // 1,000
+        m.register("B", 200.0, 5, 190.0, 220.0); // 1,000
         assert_eq!(m.total_entered_amount(), 2000.0);
     }
 
     #[test]
-    fn short_excluded_from_averaging() {
-        let mut m = RiskManager::new(RiskConfig { fib_averaging_enabled: true, fib_max_levels: 3, ..Default::default() });
-        m.register("L", Side::Long, 100.0, 10, 95.0, 110.0);
-        m.register("S", Side::Short, 100.0, 10, 105.0, 90.0);
-        assert!(m.can_average("L"));
-        assert!(!m.can_average("S"));
+    fn averaging_available_until_max_level() {
+        let mut m = RiskManager::new(RiskConfig { fib_averaging_enabled: true, fib_max_levels: 1, ..Default::default() });
+        m.register("A", 100.0, 10, 95.0, 110.0);
+        assert!(m.can_average("A"));
+        let cfg = m.cfg.clone();
+        m.average_down("A", 90.0, 10, 5.0, &cfg);
+        assert!(!m.can_average("A")); // level 1 of 1 used up
     }
 }

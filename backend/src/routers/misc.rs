@@ -3,7 +3,7 @@
 use crate::ebest::parse_float;
 use crate::state::AppState;
 use crate::timeframe::Timeframe;
-use crate::universe::{filter, info_for, name_for};
+use crate::universe::{filter, info_for, name_for, snapshot_info};
 use axum::extract::{Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -25,6 +25,7 @@ async fn ebest_status(State(st): State<AppState>) -> Api {
         "has_keys": st.settings.ebest_configured(),
         "token_ok": token_ok,
         "base_url": st.ebest.base_url(),
+        "error": if token_ok { None } else { st.ebest.last_auth_error().await },
     }))
 }
 
@@ -49,7 +50,11 @@ async fn ebest_test(State(st): State<AppState>, Query(q): Query<CodeQuery>) -> A
     let token_ok = !token.is_empty();
     checks.push(json!({
         "name": "인증 토큰 발급", "tr": "oauth2/token", "ok": token_ok, "latency_ms": ms(t0),
-        "detail": if token_ok { format!("발급 성공 (…{})", &token[token.len().saturating_sub(6)..]) } else { "토큰 발급 실패 — eBest 키/네트워크 확인 필요".into() },
+        "detail": if token_ok {
+            format!("발급 성공 (…{})", &token[token.len().saturating_sub(6)..])
+        } else {
+            st.ebest.last_auth_error().await.unwrap_or_else(|| "토큰 발급 실패 — 원인 불명".into())
+        },
     }));
 
     // 2) 5-minute candles (t8452).
@@ -111,7 +116,15 @@ async fn universe(Query(q): Query<UniverseQuery>) -> Api {
     }
     let total = rows.len();
     rows.truncate(q.limit);
-    Json(json!({"total": total, "items": rows}))
+    // 가격 필터는 CSV 스냅샷의 '현재가' 로 거른다 — 스냅샷이 오래되면 지금
+    // 가격대와 다른 종목이 후보에 섞이므로 신선도를 함께 돌려준다.
+    let (as_of, age_days) = snapshot_info();
+    Json(json!({
+        "total": total, "items": rows,
+        "universe_as_of": as_of,
+        "universe_age_days": age_days,
+        "universe_stale": age_days > 7,
+    }))
 }
 
 #[derive(Deserialize)]

@@ -21,7 +21,9 @@
   // 기본 false — 장시간 무시가 기본값이면 주말/장외에 스테일 봉으로 엔진이 돌아
   // 금요일 마지막 봉을 새 봉으로 오인하는 진입이 생길 수 있다 (테스트 시에만 수동 ON).
   // 실전 모드에서는 항상 강제 해제 (저장값이 live+ON 조합이어도).
-  let ignoreHours = (saved.mode ?? 'paper') === 'live' ? false : (saved.ignoreHours ?? false);
+  // 장시간 무시는 '테스트용 일회성 스위치'다 — 저장값을 되살리지 않고 항상 꺼진 채 시작한다.
+  // (켜둔 걸 잊고 재시작해 장외 스테일 봉으로 매매가 돌던 사고를 막기 위함)
+  let ignoreHours = false;
 
   // 주문 설정
   let orderType = saved.orderType ?? 'limit';          // limit=지정가 | market=시장가 | best=최유리지정가
@@ -83,7 +85,7 @@
   // 진입 품질 게이트 + 청산 안정화 + OOS 선별
   let requireConfirmation = saved.requireConfirmation ?? true;        // 확인봉(양봉/고점돌파)에서만 진입
   let confirmWindowBars = saved.confirmWindowBars ?? 3;               // 패턴 후 이 봉수 안의 확인도 인정
-  let requireHigherTfUptrend = saved.requireHigherTfUptrend ?? true;  // 상위 TF 하락 시 롱 진입 금지
+  let requireHigherTfUptrend = saved.requireHigherTfUptrend ?? true;  // 상위 TF 하락 시 진입 금지
   let higherTfTolerancePct = saved.higherTfTolerancePct ?? 0;         // 허용 하락 기울기 %/봉 (0=엄격)
   let minHoldBars = saved.minHoldBars ?? 1;                  // 익절/트레일링 최소 보유봉수
   // 실시간 손절 기본 ON + 버퍼 0.5% — 봉 마감 전 급락을 놓치지 않으면서
@@ -126,10 +128,44 @@
 
   const sources = ['rule', 'atr', 'volume', 'mtf', 'ml', 'gaf'];
 
+  // 전략 세대 — 'v2'(신형) / 'legacy'(기존). 두 세대는 목록을 완전히 분리해
+  // 보여준다: 신형은 진입신호+리스크규칙+시장필터를 함께 정의하는 반면,
+  // 기존 전략은 진입신호만 정의하고 리스크는 아래 폼 값을 그대로 쓴다.
+  // 섞어 쓰면 "신형인 줄 알았는데 손절이 폼 값이었다"는 사고가 난다.
+  let generation: 'v2' | 'legacy' = saved.generation ?? 'v2';
+  let presetIndex: Record<string, { label: string; note: string; names: string[] }> = {};
+
   async function loadPresets() {
-    presets = await api.presets();
+    const all = await api.presets();
+    presetIndex = (all as any)._index ?? {};
+    presets = Object.fromEntries(Object.entries(all).filter(([k]) => !k.startsWith('_')));
+    // 저장된 전략이 현재 세대에 없으면 세대를 저장값 쪽으로 맞춘다 (재방문 시
+    // 고른 전략이 조용히 다른 것으로 바뀌지 않도록).
+    const inV2 = presetIndex.v2?.names?.includes(strategy);
+    const inLegacy = presetIndex.legacy?.names?.includes(strategy);
+    if (inV2) generation = 'v2';
+    else if (inLegacy) generation = 'legacy';
+    else selectFirstOfGeneration();
     // 저장된 가중치가 있으면 사용자 값을 유지하고, 없을 때만 프리셋 기본값을 적용한다.
     if (!hasSavedWeights) applyPreset();
+  }
+  $: generationNames = presetIndex[generation]?.names ?? [];
+  $: activePreset = presets[strategy];
+  $: isV2 = activePreset?.generation === 'v2';
+  $: v2Overrides = (activePreset?.risk_overrides ?? []) as { label: string; value: string }[];
+  $: marketFilter = activePreset?.market_filter ?? null;
+
+  function selectFirstOfGeneration() {
+    const names = presetIndex[generation]?.names ?? [];
+    if (names.length && !names.includes(strategy)) {
+      strategy = names[0];
+      applyPreset();
+    }
+  }
+  function onGenerationChange(g: 'v2' | 'legacy') {
+    if (generation === g) return;
+    generation = g;
+    selectFirstOfGeneration();
   }
   function applyPreset() {
     const p = presets[strategy];
@@ -144,7 +180,7 @@
 
   // 설정값이 바뀔 때마다 localStorage에 저장 → 다음 방문 시 기본값으로 유지된다.
   $: saveTradingSettings({
-    mode, strategy, tf, watchlistText, pollSec, ignoreHours,
+    mode, strategy, generation, tf, watchlistText, pollSec, ignoreHours,
     orderType, fixedQty, sellAll, maxPositions, maxBuyAmount, maxBuyAmountLive,
     stopLossPct, takeProfitPct,
     useStopLoss, useTakeProfit, useTrailingStop, trailingStopAtr,
@@ -190,18 +226,14 @@
   }
 
   // 포지션별 실시간 현재가/미실현손익 — livePrices 우선, 없으면 엔진 값.
-  // 숏 포지션은 가격이 내려야 수익이므로 방향(dir)을 반영한다.
   function liveCur(p: any): number {
     return livePrices[p.code] ?? p.current_price ?? p.entry;
   }
-  function posDir(p: any): number {
-    return p.side === 'short' ? -1 : 1;
-  }
   function liveUpnl(p: any): number {
-    return (liveCur(p) - p.entry) * p.qty * posDir(p);
+    return (liveCur(p) - p.entry) * p.qty;
   }
   function liveUpct(p: any): number {
-    return p.entry ? ((liveCur(p) - p.entry) / p.entry) * 100 * posDir(p) : 0;
+    return p.entry ? ((liveCur(p) - p.entry) / p.entry) * 100 : 0;
   }
   // 평균매수단가 (물타기 시 수량가중 평균으로 갱신됨)
   function avgPrice(p: any): number {
@@ -215,15 +247,10 @@
   function totalEval(p: any): number {
     return liveCur(p) * p.qty;
   }
-  // 실시간 평가자산/미실현 합계 — 백엔드 equity()와 동일하게 숏은 미실현손익만 가산
-  // (숏 진입은 현금을 쓰지도 받지도 않으므로 qty×현재가로 더하면 자산이 부풀려진다).
+  // 실시간 평가자산/미실현 합계 — 백엔드 equity()와 동일 (현금 + 수량×현재가).
   $: positions = status.positions ?? [];
   $: liveEquity =
-    (status.cash ?? 0) +
-    positions.reduce(
-      (s: number, p: any) => s + (p.side === 'short' ? (p.entry - liveCur(p)) * p.qty : p.qty * liveCur(p)),
-      0
-    );
+    (status.cash ?? 0) + positions.reduce((s: number, p: any) => s + p.qty * liveCur(p), 0);
   $: liveUnrealTotal = positions.reduce((s: number, p: any) => s + liveUpnl(p), 0);
 
   // 보유 포지션 합계 (수량·총매수금액·총평가금액·미실현손익) — 표 하단 합계 행/강조 박스에 사용.
@@ -237,10 +264,27 @@
   $: buyLimitDiff = totalBuyAmt - buyLimit;
   $: buyLimitRatio = buyLimit > 0 ? (totalBuyAmt / buyLimit) * 100 : 0;
 
+  // 상세표는 기본 접힘 — 카드가 주 표현이고 표는 숫자를 훑고 싶을 때만 편다.
+  let showPosTable = false;
+
+  /// 진입가가 손절→익절 트랙에서 차지하는 위치(%) — 카드의 진입 마커에 쓴다.
+  function entryMark(p: any): number {
+    const span = (p.target ?? 0) - (p.stop ?? 0);
+    if (!(span > 0)) return 0;
+    return Math.min(100, Math.max(0, ((avgPrice(p) - p.stop) / span) * 100));
+  }
+  /// 현재가가 손절/익절 어느 쪽에 바짝 붙었는지 — 카드 테두리 강조에 쓴다.
+  function posZone(p: any): 'stop' | 'target' | 'mid' {
+    const prog = p.progress ?? 0.5;
+    if (prog <= 0.15) return 'stop';
+    if (prog >= 0.85) return 'target';
+    return 'mid';
+  }
+
   let closing: Record<string, boolean> = {};
   async function closePosition(p: any) {
     const live = status.mode === 'live';
-    const closeWord = p.side === 'short' ? '청산(매수 환매)' : '청산(매도)';
+    const closeWord = '청산(매도)';
     const msg = live
       ? `[실전] ${p.name || p.code} ${p.qty}주를 실제 시장가/지정가로 청산 주문합니다. 계속할까요?`
       : `${p.name || p.code} ${p.qty}주를 현재가로 ${closeWord}합니다. 계속할까요?`;
@@ -392,23 +436,18 @@
   });
   onDestroy(() => clearInterval(timer));
 
-  // 세션 거래 이벤트의 구분 라벨: 진입/청산 × 롱/숏.
-  // 숏은 진입이 매도(신규매도), 청산이 매수(환매)라서 type(매수/매도)만 보여주면
-  // 보유 포지션과 매칭이 안 된다 — action/side 로 명확히 표기한다.
+  // 세션 거래 이벤트의 구분 라벨: 진입(매수) / 청산(매도).
   function evLabel(ev: TradeEvent): string {
     if (!ev.action) return ev.type === 'buy' ? '매수' : '매도'; // 물타기 등 구분 없는 이벤트
-    if (ev.side === 'short') return ev.action === 'open' ? '숏 진입(매도)' : '숏 청산(매수)';
-    return ev.action === 'open' ? '롱 진입(매수)' : '롱 청산(매도)';
+    return ev.action === 'open' ? '진입(매수)' : '청산(매도)';
   }
-  // 실현손익은 '청산' 이벤트에만 있다. 숏 청산은 type=buy 이므로 type 으로
-  // 판단하면 숏의 실현손익이 숨고 숏 진입에 0원이 표시된다.
+  // 실현손익은 '청산' 이벤트에만 있다.
   function evIsClose(ev: TradeEvent): boolean {
     return ev.action ? ev.action === 'close' : ev.type === 'sell';
   }
-  // 구분 컬럼 색상: 진입(open)만 매수(빨강)/매도(파랑)로 칠하고, 청산(close)은
-  // 방향이 아니라 손익 결과(초록/분홍)로 칠한다. 진입·청산에 같은 매수 텍스트+
-  // 빨간색이 쓰이면 "매수=보유중"으로 오인해 청산 건이 보유 포지션에 없는 게
-  // 버그처럼 보인다 — 색을 분리해 진입/청산을 한눈에 구분되게 한다.
+  // 구분 컬럼 색상: 진입(open)은 매수(빨강), 청산(close)은 손익 결과(초록/분홍)로
+  // 칠한다. 진입·청산에 같은 매수 텍스트+빨간색이 쓰이면 "매수=보유중"으로 오인해
+  // 청산 건이 보유 포지션에 없는 게 버그처럼 보인다 — 색을 분리해 구분되게 한다.
   function evTagClass(ev: TradeEvent): string {
     if (evIsClose(ev)) return ev.pnl >= 0 ? 'exit-pos' : 'exit-neg';
     return ev.type === 'buy' ? 'buy-tag' : 'sell-tag';
@@ -428,7 +467,8 @@
     if (phase === '진입') return 'ph-enter';
     if (phase === '보유중') return 'ph-hold';
     if (phase === '쿨다운' || phase === '재매수가드' || phase === '마감임박' || phase === '마감청산') return 'ph-cool';
-    if (phase === '확인봉대기' || phase === '게이트미달' || phase === '상위TF역행' || phase === '숏차단') return 'ph-gate';
+    if (phase === '데이터정지' || phase === '데이터부족' || phase === '봉마감대기') return 'ph-idle';
+    if (phase === '확인봉대기' || phase === '게이트미달' || phase === '상위TF역행') return 'ph-gate';
     if (phase === '진입제한' || phase === '주문실패' || phase === '수량부족') return 'ph-block';
     return 'ph-idle';
   }
@@ -476,6 +516,188 @@
 {#if error}<div class="error">{error}</div>{/if}
 {#if info}<div class="info">ℹ️ {info}</div>{/if}
 
+<!--
+  보유 포지션 — 설정 폼보다 위, 전체 폭을 쓰는 독립 패널.
+  이전에는 '상태' 카드 안쪽 14열 표에 묻혀 있어 지금 무엇을 들고 있고 손절선에
+  얼마나 가까운지 한눈에 안 보였다. 종목당 카드 + 손절→익절 트랙으로 바꾼다.
+-->
+<section class="positions-panel" class:has-pos={positions.length > 0} class:live-mode={status.mode === 'live'}>
+  <div class="pp-head">
+    <h2>
+      보유 포지션
+      <span class="pp-count">{positions.length}</span>
+      {#if status.mode}<span class="pp-mode {status.mode === 'live' ? 'live' : 'paper'}">{status.mode === 'live' ? '실전' : '모의'}</span>{/if}
+    </h2>
+    <div class="pp-head-right">
+      {#if positions.length && liveAt}<span class="pp-liveat">⟳ 현재가 {liveAt}</span>{/if}
+      {#if positions.length}
+        <button class="pp-toggle" on:click={() => (showPosTable = !showPosTable)}>
+          {showPosTable ? '▴ 상세표 접기' : '▾ 상세표 펼치기'}
+        </button>
+      {/if}
+    </div>
+  </div>
+
+  {#if positions.length === 0}
+    <div class="pp-empty">
+      <span class="pp-empty-icon">◎</span>
+      <div>
+        <b>보유 종목 없음</b>
+        <p>{status.running ? '진입 시그널이 발생하면 자동으로 매수합니다.' : '엔진이 정지 상태입니다 — 아래에서 시작하세요.'}</p>
+      </div>
+    </div>
+  {:else}
+    <!-- 합계 히어로 -->
+    <div class="pp-totals">
+      <div class="pt-item">
+        <span class="pt-label">총 매수금액</span>
+        <span class="pt-val">{Math.round(totalBuyAmt).toLocaleString()}<em>원</em></span>
+      </div>
+      <div class="pt-item">
+        <span class="pt-label">총 평가금액</span>
+        <span class="pt-val">{Math.round(totalEvalAmt).toLocaleString()}<em>원</em></span>
+      </div>
+      <div class="pt-item hero {liveUnrealTotal >= 0 ? 'pos' : 'neg'}">
+        <span class="pt-label">미실현손익</span>
+        <span class="pt-val">{fmtPnl(liveUnrealTotal)}</span>
+        <span class="pt-sub">{fmtPct(totalUpct)}</span>
+      </div>
+      <div class="pt-item">
+        <span class="pt-label">총 수량</span>
+        <span class="pt-val">{totalQty.toLocaleString()}<em>주</em></span>
+      </div>
+      <div class="pt-item {buyLimitRatio > 100 ? 'over' : ''}">
+        <span class="pt-label">매수 한도 소진</span>
+        <span class="pt-val">{buyLimitRatio.toFixed(0)}<em>%</em></span>
+        <span class="pt-sub">{Math.round(buyLimit).toLocaleString()}원 중</span>
+      </div>
+    </div>
+
+    <!-- 종목별 카드 -->
+    <div class="pos-cards">
+      {#each positions as p (p.code)}
+        {@const upct = liveUpct(p)}
+        {@const cur = liveCur(p)}
+        <article class="pos-card {upct >= 0 ? 'up' : 'down'}" class:at-risk={posZone(p) === 'stop'} class:near-target={posZone(p) === 'target'}>
+          <header class="pc-head">
+            <div class="pc-title">
+              <strong>{p.name || p.code}</strong>
+              <span class="cd">{p.code}</span>
+            </div>
+            <span class="pc-gen {p.generation === 'v2' ? 'v2' : 'legacy'}">{p.generation === 'v2' ? 'V2' : 'LEGACY'}</span>
+          </header>
+
+          <div class="pc-price">
+            <div class="pc-cur">
+              <span class="pc-cur-val">{Math.round(cur).toLocaleString()}</span>
+              <span class="pc-cur-unit">원</span>
+            </div>
+            <div class="pc-pnl {upct >= 0 ? 'pos' : 'neg'}">
+              <span class="pc-pct">{fmtPct(upct)}</span>
+              <span class="pc-amt">{fmtPnl(liveUpnl(p))}</span>
+            </div>
+          </div>
+
+          <!-- 손절 ── 진입 ── 현재 ── 익절 트랙 -->
+          <div class="pc-track" title="손절선과 익절선 사이에서 현재가의 위치">
+            <div class="tr-bar">
+              <div class="tr-fill {upct >= 0 ? 'pos' : 'neg'}" style="width:{(p.progress ?? 0) * 100}%"></div>
+              <div class="tr-entry" style="left:{entryMark(p)}%" title="진입가 {Math.round(avgPrice(p)).toLocaleString()}원"></div>
+              <div class="tr-now" style="left:{(p.progress ?? 0) * 100}%"></div>
+            </div>
+            <div class="tr-ends">
+              <span class="tr-stop">손절 {Math.round(p.stop).toLocaleString()} <em>{fmtPct(p.stop_pct ?? 0)}</em></span>
+              <span class="tr-r {(p.r_multiple ?? 0) >= 0 ? 'pos' : 'neg'}">{(p.r_multiple ?? 0) >= 0 ? '+' : ''}{(p.r_multiple ?? 0).toFixed(2)}R</span>
+              <span class="tr-target">
+                {#if p.use_take_profit === false}
+                  익절 <em>러너</em>
+                {:else}
+                  익절 {Math.round(p.target).toLocaleString()} <em>{fmtPct(p.target_pct ?? 0)}</em>
+                {/if}
+              </span>
+            </div>
+          </div>
+
+          <dl class="pc-facts">
+            <div><dt>수량</dt><dd>{p.qty.toLocaleString()}주</dd></div>
+            <div><dt>평균단가</dt><dd>{Math.round(avgPrice(p)).toLocaleString()}</dd></div>
+            <div><dt>매수금액</dt><dd>{Math.round(totalBuy(p)).toLocaleString()}</dd></div>
+            <div><dt>평가금액</dt><dd>{Math.round(totalEval(p)).toLocaleString()}</dd></div>
+          </dl>
+
+          <footer class="pc-foot">
+            <div class="pc-meta">
+              <span class="pc-chip sig">{p.pattern || '-'}</span>
+              <span class="pc-chip">{p.strategy}</span>
+              <span class="pc-chip">{p.tf}</span>
+              {#if p.hard_stop_intrabar}<span class="pc-chip guard" title="봉 마감을 기다리지 않고 실시간가로 손절합니다">⚡ 실시간손절</span>{/if}
+              {#if p.fib_level > 0}<span class="pc-chip fib">물타기 {p.fib_level}차</span>{/if}
+            </div>
+            <div class="pc-actions">
+              <span class="pc-since">{fmtTime(p.opened_at)} · {p.bars_held ?? 0}봉</span>
+              <button class="close-pos" disabled={closing[p.code]} on:click={() => closePosition(p)}
+                title="이 종목을 전량 청산(매도)합니다">
+                {closing[p.code] ? '…' : '✕ 청산'}
+              </button>
+            </div>
+          </footer>
+        </article>
+      {/each}
+    </div>
+
+    {#if showPosTable}
+      <table class="pp-table">
+        <thead>
+          <tr>
+            <th>종목</th><th>코드</th><th>진입신호</th><th>진입시각</th><th>수량</th>
+            <th>평균단가</th><th>총 진입금액</th><th>현재가</th><th>총 평가금액</th>
+            <th>미실현손익</th><th>수익률</th><th>손절</th><th>익절</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each positions as p}
+            <tr>
+              <td><strong>{p.name || '-'}</strong></td>
+              <td class="cd">{p.code}</td>
+              <td class="sig">{p.pattern || '-'}</td>
+              <td class="cd">{fmtTime(p.opened_at)}</td>
+              <td class="num">{p.qty}</td>
+              <td class="num buy">{Math.round(avgPrice(p)).toLocaleString()}</td>
+              <td class="num">{Math.round(totalBuy(p)).toLocaleString()}</td>
+              <td class="num live">{Math.round(liveCur(p)).toLocaleString()}</td>
+              <td class="num">{Math.round(totalEval(p)).toLocaleString()}</td>
+              <td class="num {liveUpnl(p) >= 0 ? 'pos' : 'neg'}">{fmtPnl(liveUpnl(p))}</td>
+              <td class="num {liveUpct(p) >= 0 ? 'pos' : 'neg'}">{fmtPct(liveUpct(p))}</td>
+              <td class="num neg">{Math.round(p.stop).toLocaleString()}</td>
+              <td class="num pos">{p.use_take_profit === false ? '러너' : Math.round(p.target).toLocaleString()}</td>
+            </tr>
+          {/each}
+        </tbody>
+        <tfoot>
+          <tr class="totals-row">
+            <td colspan="4">합계 ({positions.length}종목)</td>
+            <td class="num">{totalQty}</td>
+            <td class="num">-</td>
+            <td class="num">{Math.round(totalBuyAmt).toLocaleString()}</td>
+            <td class="num">-</td>
+            <td class="num">{Math.round(totalEvalAmt).toLocaleString()}</td>
+            <td class="num {liveUnrealTotal >= 0 ? 'pos' : 'neg'}">{fmtPnl(liveUnrealTotal)}</td>
+            <td class="num {totalUpct >= 0 ? 'pos' : 'neg'}">{fmtPct(totalUpct)}</td>
+            <td colspan="2"></td>
+          </tr>
+        </tfoot>
+      </table>
+    {/if}
+
+    {#if buyLimitRatio > 100}
+      <p class="pp-over">
+        ⚠️ 총매수금액이 매수 한도액을 <b>{(buyLimitRatio / 100).toFixed(1)}배</b> 초과했습니다
+        (+{Math.round(buyLimitDiff).toLocaleString()}원) — 신규 진입이 차단됩니다.
+      </p>
+    {/if}
+  {/if}
+</section>
+
 <div class="grid">
   <section class="card">
     <h3>실행 설정</h3>
@@ -489,9 +711,71 @@
         </button>
       </div>
     </div>
-    <div class="row"><label>전략</label>
-      <select bind:value={strategy} on:change={onStrategyChange}>{#each Object.keys(presets) as p}<option>{p}</option>{/each}</select>
+    <div class="row"><label>전략 세대</label>
+      <div class="seg gen-seg">
+        <button class:active={generation==='v2'} class:v2={generation==='v2'} on:click={() => onGenerationChange('v2')}>
+          ✨ 신형 (V2)
+        </button>
+        <button class:active={generation==='legacy'} on:click={() => onGenerationChange('legacy')}>
+          기존 (레거시)
+        </button>
+      </div>
     </div>
+    <div class="row"><label>전략</label>
+      <select class="strat-select" class:v2-select={isV2} bind:value={strategy} on:change={onStrategyChange}>
+        {#each generationNames as p}<option value={p}>{p}</option>{/each}
+      </select>
+    </div>
+
+    {#if presetIndex[generation]}
+      <div class="gen-panel" class:v2={generation === 'v2'}>
+        <div class="gen-head">
+          <span class="gen-badge" class:v2={generation === 'v2'}>
+            {generation === 'v2' ? 'V2' : 'LEGACY'}
+          </span>
+          <b>{presetIndex[generation].label}</b>
+        </div>
+        <p class="gen-note">{presetIndex[generation].note}</p>
+
+        {#if activePreset?.summary}
+          <p class="strat-summary">{activePreset.summary}</p>
+        {/if}
+
+        {#if isV2}
+          <div class="v2-facts">
+            {#if v2Overrides.length}
+              <div class="v2-block">
+                <h6>이 전략이 강제하는 리스크 규칙</h6>
+                <dl>
+                  {#each v2Overrides as o}
+                    <div><dt>{o.label}</dt><dd>{o.value}</dd></div>
+                  {/each}
+                </dl>
+              </div>
+            {/if}
+            {#if marketFilter?.enabled}
+              <div class="v2-block">
+                <h6>시장 필터</h6>
+                <dl>
+                  <div><dt>시장 기준</dt><dd>{marketFilter.proxy_code} (KODEX 200)</dd></div>
+                  <div><dt>리스크온 요구</dt><dd>{marketFilter.require_risk_on ? 'ON — 시장이 EMA20 아래면 진입 금지' : 'OFF'}</dd></div>
+                  <div><dt>상대강도 하한</dt><dd>{marketFilter.min_rs >= 0 ? '+' : ''}{marketFilter.min_rs}%p ({marketFilter.rs_lookback}봉)</dd></div>
+                </dl>
+              </div>
+            {/if}
+          </div>
+          <p class="v2-warn">
+            ⚠️ 아래 <b>손절·익절 / 진입 품질</b> 카드의 값 중 위에 표시된 항목은
+            이 전략이 <b>덮어씁니다</b>. 폼 값은 표시되지 않은 항목에만 적용됩니다.
+          </p>
+        {:else}
+          <p class="legacy-warn">
+            ⚠️ 기존 전략은 <b>진입 신호만</b> 정의합니다. 손절·익절·실시간 손절은
+            전적으로 아래 폼 값을 따르며, <b>시장(지수) 필터와 상대강도 필터가 없습니다</b>.
+          </p>
+        {/if}
+      </div>
+    {/if}
     <div class="row"><label>타임프레임</label>
       <select bind:value={tf}>{#each ['1m','3m','5m','10m','15m','30m','60m','1d'] as t}<option>{t}</option>{/each}</select>
     </div>
@@ -511,10 +795,17 @@
     {/if}
     <div class="row"><label>폴링(초)</label><input type="number" bind:value={pollSec} min="2" /></div>
     <div class="row">
-      <label title="장외/주말에도 엔진을 돌립니다 (테스트용). 실전 모드에서는 스테일 봉 기반 실주문을 막기 위해 사용할 수 없습니다.">장시간 무시</label>
+      <label title="장외/주말에도 엔진 루프를 돌립니다 (테스트용). 실전 모드에서는 사용할 수 없습니다.">장시간 무시</label>
       <input type="checkbox" bind:checked={ignoreHours} disabled={mode === 'live'} />
       {#if mode === 'live'}<span class="unit">실전에서는 사용 불가</span>{/if}
     </div>
+    {#if ignoreHours}
+      <p class="warn-note">
+        ⚠️ 테스트용입니다. 켜도 <b>마감 청산(15:05 진입중단 / 15:10 전량청산)</b>과
+        <b>봉 신선도 검사</b>는 그대로 동작하므로, 장외에는 매매 없이 “데이터정지” 상태로만 표시됩니다.
+        페이지를 새로 열면 자동으로 꺼집니다.
+      </p>
+    {/if}
     <div class="actions">
       {#if status.running}
         <button class="stop" on:click={stop}>■ 정지</button>
@@ -549,7 +840,7 @@
       <span class="unit">주</span>
     </div>
     <div class="row">
-      <label title="보유 포지션 전체(롱+숏) 진입금액 합계에 대한 한도 — 1회 주문 한도가 아닙니다">
+      <label title="보유 포지션 전체의 진입금액 합계에 대한 한도 — 1회 주문 한도가 아닙니다">
         {mode === 'live' ? '매수 한도액 (실전)' : '매수 한도액 (모의)'}
       </label>
       {#if mode === 'live'}
@@ -585,8 +876,14 @@
     </p>
   </section>
 
-  <section class="card">
-    <h3>손절 · 익절 설정</h3>
+  <section class="card" class:overridden={isV2}>
+    <h3>손절 · 익절 설정{#if isV2} <span class="ovr-tag">전략이 덮어씀</span>{/if}</h3>
+    {#if isV2}
+      <p class="ovr-note">
+        <b>{strategy}</b> 은(는) 손절·익절을 <b>ATR 비례</b>로 강제합니다 — 아래 고정 %는
+        <b>무시</b>됩니다. 고정 %를 쓰려면 전략 세대를 <b>기존(레거시)</b>로 바꾸세요.
+      </p>
+    {/if}
     <p class="hint">매수가(평균단가) 대비 고정 비율로 손절/익절선을 잡습니다. <b>0이면 ATR 변동성 기준으로 자동 산정</b>합니다. 물타기로 평단이 바뀌면 새 평단 기준으로 다시 계산됩니다.</p>
     <div class="row">
       <label>손절 비율</label>
@@ -753,13 +1050,16 @@
         <div class="cfg-group">
           <h5>실행</h5>
           <dl>
-            <div><dt>전략</dt><dd>{status.strategy ?? strategy}</dd></div>
-            <div><dt>방향</dt><dd>
-              {status.direction ?? '-'}
-              {#if status.direction === 'both' || status.direction === 'short_only'}
-                <span class="sub-note">— 숏 신호는 감지만 되고 진입은 항상 차단됩니다 (모의·실전 공통, 공매도 미지원)</span>
-              {/if}
+            <div><dt>전략</dt><dd>
+              {status.strategy ?? strategy}
+              <span class="gen-badge sm {status.generation === 'v2' ? 'v2' : ''}">{status.generation === 'v2' ? 'V2' : 'LEGACY'}</span>
             </dd></div>
+            {#if status.market}
+              <div><dt>시장 상태</dt><dd class={status.market.risk_on ? 'pos' : 'neg'}>
+                {status.market.risk_on ? '리스크온' : '리스크오프'}
+                <span class="sub-note">{status.market.proxy_code} {status.market.ret_pct >= 0 ? '+' : ''}{status.market.ret_pct}%</span>
+              </dd></div>
+            {/if}
             <div><dt>타임프레임</dt><dd>{status.timeframe ?? tf}</dd></div>
             <div><dt>진입 임계</dt><dd>{(status.entry_threshold ?? entryThreshold).toFixed(2)}</dd></div>
             <div><dt>폴링 주기</dt><dd>{status.poll_sec ?? pollSec}초</dd></div>
@@ -793,7 +1093,10 @@
 
         {#if cfgRisk}
           <div class="cfg-group">
-            <h5>리스크 · 사이징</h5>
+            <h5>리스크 · 사이징{#if (status.risk_overrides ?? []).length} <span class="ovr-tag">전략 적용값</span>{/if}</h5>
+            {#if (status.risk_overrides ?? []).length}
+              <p class="ovr-note">아래는 전략의 규칙이 적용된 <b>실제 실행값</b>입니다 (폼 입력값이 아님).</p>
+            {/if}
             <dl>
               <div><dt>거래당 리스크</dt><dd>{asPct(cfgRisk.risk_per_trade_pct)}</dd></div>
               <div><dt>종목당 비중상한</dt><dd>{asPct(cfgRisk.max_position_pct)}</dd></div>
@@ -893,73 +1196,6 @@
       </tbody>
     </table>
 
-    <h4>보유 포지션 ({status.positions?.length ?? 0}) <span class="sub-note">— 진입 시그널로 체결된 보유분 (평균 진입단가 기준 분석)</span></h4>
-    <table>
-      <thead>
-        <tr>
-          <th>종목</th><th>코드</th><th>구분</th><th>진입신호</th><th>진입시각</th><th>수량</th>
-          <th>평균단가</th><th>총 진입금액</th><th>현재가</th><th>총 평가금액</th>
-          <th>미실현손익</th><th>수익률</th><th>손절</th><th>익절</th><th>청산</th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each positions as p}
-          <tr>
-            <td><strong>{p.name || '-'}</strong></td>
-            <td class="cd">{p.code}</td>
-            <td class={p.side === 'short' ? 'sell-tag' : 'buy-tag'}>{p.side === 'short' ? '숏' : '롱'}</td>
-            <td class="sig">{p.pattern || '-'}</td>
-            <td class="cd">{fmtTime(p.opened_at)}</td>
-            <td class="num">{p.qty}</td>
-            <td class="num buy">{Math.round(avgPrice(p)).toLocaleString()}</td>
-            <td class="num">{Math.round(totalBuy(p)).toLocaleString()}</td>
-            <td class="num live">{Math.round(liveCur(p)).toLocaleString()}</td>
-            <td class="num">{Math.round(totalEval(p)).toLocaleString()}</td>
-            <td class="num {liveUpnl(p) >= 0 ? 'pos' : 'neg'}">{fmtPnl(liveUpnl(p))}</td>
-            <td class="num {liveUpct(p) >= 0 ? 'pos' : 'neg'}">{fmtPct(liveUpct(p))}</td>
-            <td class="num neg">{Math.round(p.stop).toLocaleString()}</td>
-            <td class="num pos">{Math.round(p.target).toLocaleString()}</td>
-            <td class="ctd">
-              <button class="close-pos" disabled={closing[p.code]} on:click={() => closePosition(p)}
-                title={p.side === 'short' ? '이 종목을 전량 청산(매수 환매)합니다' : '이 종목을 전량 청산(매도)합니다'}>
-                {closing[p.code] ? '…' : '✕ 청산'}
-              </button>
-            </td>
-          </tr>
-        {/each}
-        {#if positions.length === 0}<tr><td colspan="15" class="empty">보유 없음 — 진입 시그널 발생 시 자동 진입됩니다</td></tr>{/if}
-      </tbody>
-      {#if positions.length > 0}
-        <tfoot>
-          <tr class="totals-row">
-            <td colspan="5">합계 ({positions.length}종목)</td>
-            <td class="num">{totalQty}</td>
-            <td class="num">-</td>
-            <td class="num">{Math.round(totalBuyAmt).toLocaleString()}</td>
-            <td class="num">-</td>
-            <td class="num">{Math.round(totalEvalAmt).toLocaleString()}</td>
-            <td class="num {liveUnrealTotal >= 0 ? 'pos' : 'neg'}">{fmtPnl(liveUnrealTotal)}</td>
-            <td class="num {totalUpct >= 0 ? 'pos' : 'neg'}">{fmtPct(totalUpct)}</td>
-            <td colspan="3"></td>
-          </tr>
-        </tfoot>
-      {/if}
-    </table>
-
-    {#if positions.length > 0}
-      <div class="limit-compare {buyLimitDiff > 0 ? 'over' : 'under'}">
-        <span class="lc-label">총매수금액 합계</span>
-        <span class="lc-val">{Math.round(totalBuyAmt).toLocaleString()}원</span>
-        <span class="lc-vs">vs</span>
-        <span class="lc-label">매수 한도액 (총 진입금액)</span>
-        <span class="lc-val">{Math.round(buyLimit).toLocaleString()}원</span>
-        <span class="lc-diff">
-          차이 <b>{buyLimitDiff >= 0 ? '+' : ''}{Math.round(buyLimitDiff).toLocaleString()}원</b>
-          · <b>{buyLimitRatio.toFixed(0)}%</b>{buyLimitRatio > 100 ? ` (한도 ${(buyLimitRatio / 100).toFixed(1)}배)` : ''}
-        </span>
-      </div>
-    {/if}
-
     {#if tradeEvents.length > 0}
       <div class="h4row">
         <h4>이번 세션 거래 ({tradeEvents.length}건)</h4>
@@ -1023,15 +1259,13 @@
     <div class="journal-scroll">
       <table>
         <thead>
-          <tr><th>청산시간</th><th>종목</th><th>구분</th><th>패턴</th><th>수량</th><th>진입가</th><th>청산가</th><th>실현손익</th><th>수익률</th><th>사유</th></tr>
+          <tr><th>청산시간</th><th>종목</th><th>패턴</th><th>수량</th><th>진입가</th><th>청산가</th><th>실현손익</th><th>수익률</th><th>사유</th></tr>
         </thead>
         <tbody>
           {#each journalTrades as t}
             <tr>
               <td class="cd">{(t.closed_at || '').slice(0, 16).replace('T', ' ')}</td>
               <td class="cd">{t.code}</td>
-              <td class={t.side === 'short' ? 'sell-tag' : t.side === 'long' ? 'buy-tag' : 'cd'}>
-                {t.side === 'short' ? '숏' : t.side === 'long' ? '롱' : '-'}</td>
               <td class="cd">{t.pattern || '-'}</td>
               <td class="num">{t.qty}</td>
               <td class="num">{Math.round(t.entry).toLocaleString()}</td>
@@ -1068,6 +1302,165 @@
   .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
   .card { background: #181825; border-radius: 10px; padding: 16px; }
   .card.status { grid-column: 1 / -1; }
+
+  /* ---------- 전략 세대 구분 (신형 V2 / 기존 레거시) ---------- */
+  .gen-seg button.active.v2 { background: #cba6f7; color: #1e1e2e; }
+  .strat-select.v2-select { border-color: #cba6f7; box-shadow: 0 0 0 1px #cba6f733; }
+  .gen-panel {
+    background: #1e1e2e; border: 1px solid #45475a; border-left: 3px solid #6c7086;
+    border-radius: 6px; padding: 10px 12px; margin: -2px 0 12px;
+  }
+  .gen-panel.v2 { border-left-color: #cba6f7; background: #211d2e; }
+  .gen-head { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .gen-badge {
+    font-size: 10px; font-weight: 800; letter-spacing: .06em; padding: 2px 6px;
+    border-radius: 3px; background: #45475a; color: #cdd6f4;
+  }
+  .gen-badge.v2 { background: #cba6f7; color: #1e1e2e; }
+  .gen-badge.sm { font-size: 9px; padding: 1px 4px; margin-left: 5px; vertical-align: middle; }
+  .ovr-tag {
+    font-size: 9.5px; font-weight: 700; background: #cba6f7; color: #1e1e2e;
+    padding: 1px 5px; border-radius: 3px; margin-left: 4px;
+  }
+  .ovr-note { font-size: 10.5px; color: #cba6f7; margin: -4px 0 8px; line-height: 1.45; }
+  /* 전략이 값을 덮어쓰는 카드는 폼 값이 그대로 먹히는 카드와 시각적으로 구분한다. */
+  .card.overridden { box-shadow: inset 3px 0 0 #cba6f7; }
+  .card.overridden .ovr-note {
+    font-size: 11.5px; background: #2a2440; border-radius: 5px;
+    padding: 7px 9px; margin: 0 0 10px;
+  }
+  .gen-note { font-size: 11.5px; color: #a6adc8; margin: 6px 0 0; line-height: 1.5; }
+  .strat-summary {
+    font-size: 12px; color: #cdd6f4; margin: 8px 0 0; line-height: 1.55;
+    padding: 7px 9px; background: #181825; border-radius: 5px;
+  }
+  .v2-facts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+  .v2-block { background: #181825; border-radius: 5px; padding: 8px 10px; }
+  .v2-block h6 { margin: 0 0 6px; font-size: 11px; color: #cba6f7; font-weight: 700; }
+  .v2-block dl { margin: 0; display: flex; flex-direction: column; gap: 3px; }
+  .v2-block dl > div { display: flex; justify-content: space-between; gap: 8px; font-size: 11.5px; }
+  .v2-block dt { color: #a6adc8; white-space: nowrap; }
+  .v2-block dd { margin: 0; color: #cdd6f4; font-weight: 600; text-align: right; }
+  .v2-warn, .legacy-warn {
+    font-size: 11.5px; margin: 8px 0 0; padding: 6px 9px; border-radius: 5px; line-height: 1.5;
+  }
+  .v2-warn { background: #2a2440; color: #cba6f7; }
+  .legacy-warn { background: #2a2717; color: #f9e2af; }
+  @media (max-width: 1100px) { .v2-facts { grid-template-columns: 1fr; } }
+
+  /* ---------- 보유 포지션 패널 ---------- */
+  .positions-panel {
+    background: #181825; border-radius: 12px; padding: 16px 18px; margin-bottom: 16px;
+    border: 1px solid #313244;
+  }
+  /* 보유분이 있을 때만 눈에 띄게 — 비었을 땐 조용히 자리만 지킨다. */
+  .positions-panel.has-pos { border-color: #45516e; box-shadow: 0 0 0 1px #89b4fa22, 0 6px 22px #0006; }
+  .positions-panel.has-pos.live-mode { border-color: #6e4552; box-shadow: 0 0 0 1px #f38ba822, 0 6px 22px #0006; }
+  .pp-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .pp-head h2 { margin: 0; font-size: 16px; display: flex; align-items: center; gap: 8px; }
+  .pp-count {
+    background: #89b4fa; color: #1e1e2e; font-size: 13px; font-weight: 800;
+    min-width: 24px; text-align: center; padding: 1px 7px; border-radius: 11px;
+  }
+  .pp-mode { font-size: 11px; padding: 2px 7px; border-radius: 3px; font-weight: 700; }
+  .pp-mode.paper { background: #2d3a2d; color: #a6e3a1; }
+  .pp-mode.live { background: #3d2a30; color: #f38ba8; }
+  .pp-head-right { display: flex; align-items: center; gap: 10px; }
+  .pp-liveat { font-size: 11.5px; color: #f9e2af; }
+  .pp-toggle {
+    background: #313244; color: #cdd6f4; border: none; border-radius: 5px;
+    padding: 5px 11px; font-size: 12px; cursor: pointer;
+  }
+  .pp-empty { display: flex; align-items: center; gap: 14px; padding: 18px 4px 6px; color: #a6adc8; }
+  .pp-empty-icon { font-size: 30px; color: #45475a; }
+  .pp-empty b { color: #bac2de; font-size: 13px; }
+  .pp-empty p { margin: 3px 0 0; font-size: 12px; }
+
+  .pp-totals {
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin: 14px 0 16px;
+  }
+  .pt-item {
+    background: #1e1e2e; border-radius: 8px; padding: 9px 12px;
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .pt-item.hero { background: #232135; }
+  .pt-item.hero.pos { box-shadow: inset 3px 0 0 #a6e3a1; }
+  .pt-item.hero.neg { box-shadow: inset 3px 0 0 #f38ba8; }
+  .pt-item.over { box-shadow: inset 3px 0 0 #f9e2af; }
+  .pt-label { font-size: 11px; color: #a6adc8; }
+  .pt-val { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; color: #cdd6f4; }
+  .pt-val em { font-size: 11px; font-style: normal; color: #a6adc8; margin-left: 2px; }
+  .pt-item.hero.pos .pt-val, .pt-item.hero.pos .pt-sub { color: #a6e3a1; }
+  .pt-item.hero.neg .pt-val, .pt-item.hero.neg .pt-sub { color: #f38ba8; }
+  .pt-sub { font-size: 11.5px; color: #a6adc8; font-variant-numeric: tabular-nums; }
+  @media (max-width: 1100px) { .pp-totals { grid-template-columns: repeat(2, 1fr); } }
+
+  .pos-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 12px; }
+  .pos-card {
+    background: #1e1e2e; border: 1px solid #313244; border-radius: 10px;
+    padding: 12px 13px; display: flex; flex-direction: column; gap: 10px;
+    border-top: 3px solid #45475a;
+  }
+  .pos-card.up { border-top-color: #a6e3a1; }
+  .pos-card.down { border-top-color: #f38ba8; }
+  /* 손절선/익절선에 바짝 붙은 종목은 테두리로 즉시 눈에 띄게 한다. */
+  .pos-card.at-risk { border-color: #6e4552; background: #221c22; }
+  .pos-card.near-target { border-color: #3f5c46; background: #1b2320; }
+  .pc-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+  .pc-title { display: flex; flex-direction: column; gap: 1px; line-height: 1.25; }
+  .pc-title strong { font-size: 14px; }
+  .pc-gen { font-size: 9.5px; font-weight: 800; letter-spacing: .05em; padding: 2px 5px; border-radius: 3px; }
+  .pc-gen.v2 { background: #cba6f7; color: #1e1e2e; }
+  .pc-gen.legacy { background: #45475a; color: #bac2de; }
+  .pc-price { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+  .pc-cur-val { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .pc-cur-unit { font-size: 11px; color: #a6adc8; margin-left: 2px; }
+  .pc-pnl { display: flex; flex-direction: column; align-items: flex-end; line-height: 1.2; }
+  .pc-pct { font-size: 17px; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .pc-amt { font-size: 12px; font-variant-numeric: tabular-nums; }
+  .pc-pnl.pos { color: #a6e3a1; } .pc-pnl.neg { color: #f38ba8; }
+
+  .pc-track { display: flex; flex-direction: column; gap: 5px; }
+  .tr-bar { position: relative; height: 7px; background: #313244; border-radius: 4px; }
+  .tr-fill { position: absolute; inset: 0 auto 0 0; border-radius: 4px; }
+  .tr-fill.pos { background: linear-gradient(90deg, #45475a, #a6e3a1); }
+  .tr-fill.neg { background: linear-gradient(90deg, #f38ba8, #6e4552); }
+  .tr-entry {
+    position: absolute; top: -3px; width: 2px; height: 13px; background: #f9e2af;
+    transform: translateX(-1px); border-radius: 1px;
+  }
+  .tr-now {
+    position: absolute; top: -3.5px; width: 12px; height: 14px; border-radius: 3px;
+    background: #cdd6f4; border: 2px solid #181825; transform: translateX(-6px);
+  }
+  .tr-ends { display: flex; justify-content: space-between; align-items: center; font-size: 10.5px; gap: 6px; }
+  .tr-stop { color: #f38ba8; } .tr-target { color: #a6e3a1; }
+  .tr-ends em { font-style: normal; opacity: .75; }
+  .tr-r { font-weight: 800; font-variant-numeric: tabular-nums; font-size: 11.5px; }
+  .tr-r.pos { color: #a6e3a1; } .tr-r.neg { color: #f38ba8; }
+
+  .pc-facts {
+    margin: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 3px 10px;
+    padding: 8px 0; border-top: 1px solid #2a2a3c; border-bottom: 1px solid #2a2a3c;
+  }
+  .pc-facts > div { display: flex; justify-content: space-between; gap: 6px; font-size: 11.5px; }
+  .pc-facts dt { color: #a6adc8; }
+  .pc-facts dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .pc-foot { display: flex; flex-direction: column; gap: 8px; }
+  .pc-meta { display: flex; flex-wrap: wrap; gap: 4px; }
+  .pc-chip {
+    font-size: 10px; padding: 2px 6px; border-radius: 3px; background: #313244; color: #bac2de;
+  }
+  .pc-chip.sig { background: #2b3550; color: #89b4fa; font-weight: 600; }
+  .pc-chip.guard { background: #2a2440; color: #cba6f7; }
+  .pc-chip.fib { background: #3a3320; color: #f9e2af; }
+  .pc-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .pc-since { font-size: 10.5px; color: #6c7086; }
+  .pp-table { margin-top: 14px; }
+  .pp-over {
+    margin: 12px 0 0; font-size: 12px; color: #f9e2af; background: #2a2717;
+    border-radius: 6px; padding: 8px 11px;
+  }
   h3 { margin: 0 0 14px; font-size: 15px; }
   h4 { margin: 16px 0 8px; font-size: 13px; color: #bac2de; }
   .row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
@@ -1132,6 +1525,8 @@
   .num.buy { color: #cdd6f4; font-weight: 600; }
   .sig { color: #a6e3a1; font-size: 12px; }
   .sub-note { font-size: 12px; color: #a6adc8; font-weight: 400; }
+  .warn-note { margin: 4px 0 8px; padding: 8px 10px; background: #2a2416; border-left: 3px solid #f9e2af;
+               border-radius: 4px; font-size: 12px; color: #f9e2af; line-height: 1.5; }
   .sym-strats { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
   .sym-chip { background: #1e1e2e; border: 1px solid #313244; border-radius: 10px; padding: 2px 8px; font-size: 12px; }
   .sym-chip b { color: #cba6f7; }
@@ -1166,18 +1561,6 @@
   .totals-row { background: #1e1e2e; font-weight: 700; }
   .totals-row td { border-top: 2px solid #45475a; border-bottom: none; }
   .totals-row td:first-child { color: #bac2de; font-weight: 600; }
-  .limit-compare {
-    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-    margin-top: 10px; padding: 10px 14px; border-radius: 8px; font-size: 13px;
-    background: #1e1e2e; border: 1px solid #45475a;
-  }
-  .limit-compare .lc-label { color: #bac2de; }
-  .limit-compare .lc-val { font-weight: 700; color: #cdd6f4; }
-  .limit-compare .lc-vs { color: #a6adc8; font-size: 11px; }
-  .limit-compare .lc-diff { margin-left: auto; font-size: 13px; }
-  .limit-compare.over { border-color: #4a2f36; }
-  .limit-compare.over .lc-diff { color: #f38ba8; }
-  .limit-compare.under .lc-diff { color: #a6e3a1; }
   .h4row { display: flex; justify-content: space-between; align-items: center; }
   .h4row h4 { margin: 16px 0 8px; }
   .hdr-right { display: flex; align-items: center; gap: 10px; }

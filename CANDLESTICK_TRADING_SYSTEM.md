@@ -1,5 +1,14 @@
 # Caginalp & Laurent (1998) Candlestick Pattern Trading System
 
+> ⚠️ **구현 범위 안내 (롱 전용)**
+> 이 문서는 원 설계 스펙이며, 하락 반전 패턴(`three_black_crows`, `evening_star`,
+> `hanging_man`, `bearish_engulfing` 등)과 `pattern_type`, `side`, `direction`
+> (`long_only` / `long_short`) 개념을 포함한다.
+> **현재 구현은 매수 전용(롱 전용)으로 통일되어 이 부분들이 모두 제거되었다** —
+> 하락 패턴 탐지기, 숏 진입/환매 주문 경로, 방향 설정, `pattern_type` 필드는
+> 존재하지 않는다. 모든 진입은 매수, 모든 청산은 매도다.
+> 실제 동작은 [CHART_AND_SIGNAL_ANALYSIS.md](CHART_AND_SIGNAL_ANALYSIS.md) 를 참조할 것.
+
 > 기반 논문: *"The Predictive Power of Price Patterns"* — Caginalp & Laurent, 1998  
 > 원 연구 대상: 1992~1996년 미국 S&P 500 일봉 데이터  
 > 본 시스템: **한국 주식시장(KOSPI/KOSDAQ)** + **멀티 타임프레임** + **최신 연구 방법론(2019–2024) 통합**

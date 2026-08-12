@@ -47,7 +47,7 @@ async fn get_patterns(State(st): State<AppState>, Path(shcode): Path<String>, Qu
     if q.mtf && !results.is_empty() {
         let engine = MtfEngine::new(&st.fetcher, &st.detector);
         for r in &mut results {
-            r.mtf_score = engine.score(&token, &shcode, tf, &r.pattern_type).await;
+            r.mtf_score = engine.score(&token, &shcode, tf).await;
             apply_strategy(r, &cfg, true, false, false);
         }
     }
@@ -55,7 +55,7 @@ async fn get_patterns(State(st): State<AppState>, Path(shcode): Path<String>, Qu
     if candles.len() >= 3 {
         let ctx = SessionContext::for_tf(&candles, tf);
         let series = SetupSeries::compute(&candles);
-        let mut setups = detect_setups(&candles, candles.len() - 1, &ctx, &series, &cfg.enabled_patterns, cfg.allows_short());
+        let mut setups = detect_setups(&candles, candles.len() - 1, &ctx, &series, &cfg.enabled_patterns);
         for s in &mut setups {
             apply_strategy(s, &cfg, false, false, false);
         }

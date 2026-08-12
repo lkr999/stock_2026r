@@ -1,12 +1,12 @@
 //! Automated trading control endpoints (spec section 10-5).
 
-use crate::backtest::{evaluate_strategy_live, CostModel};
+use crate::backtest::{evaluate_strategy_live, CostModel, MtfContext};
 use crate::broker::{Broker, TradingMode};
 use crate::config::Settings;
 use crate::engine::{OrderConfig, TradingEngine};
 use crate::risk::{RiskConfig, RiskManager};
 use crate::state::AppState;
-use crate::strategy::{self, presets, Source, StrategyConfig};
+use crate::strategy::{self, StrategyConfig};
 use crate::timeframe::Timeframe;
 use crate::validation::{evaluate, ReadinessCriteria};
 use axum::extract::{Path, Query, State};
@@ -134,20 +134,35 @@ async fn clear_journal(State(st): State<AppState>, Query(q): Query<ModeQuery>) -
     Ok(Json(json!({"ok": true, "removed": removed})))
 }
 
-/// `GET /api/trading/presets` — the built-in strategy presets.
+/// `GET /api/trading/presets` — the built-in strategy presets of both
+/// generations, plus a `_index` listing each generation's members so the picker
+/// can keep legacy and v2 strictly apart.
 async fn list_presets() -> ApiResult {
     let mut out = serde_json::Map::new();
-    for cfg in presets() {
-        let weights: serde_json::Map<String, Value> = Source::all()
-            .iter()
-            .map(|s| (s.as_str().to_string(), json!(cfg.weights.get(s).copied().unwrap_or(0.0))))
-            .collect();
-        out.insert(cfg.name.clone(), json!({
-            "name": cfg.name, "weights": weights, "enabled_patterns": cfg.enabled_patterns,
-            "entry_threshold": cfg.entry_threshold, "direction": cfg.direction,
-            "recommended_tf": cfg.recommended_tf,
-        }));
+    for cfg in strategy::all_presets() {
+        out.insert(cfg.name.clone(), cfg.to_json());
     }
+    let names = |gen| {
+        strategy::presets_of(gen)
+            .into_iter()
+            .map(|c| c.name)
+            .collect::<Vec<_>>()
+    };
+    out.insert(
+        "_index".into(),
+        json!({
+            "legacy": {
+                "label": "기존 전략 (레거시)",
+                "note": "진입 신호만 정의합니다. 손절·익절은 아래 폼 값을 그대로 사용하며, 시장(지수) 필터가 없습니다.",
+                "names": names(strategy::Generation::Legacy),
+            },
+            "v2": {
+                "label": "신형 전략 (V2)",
+                "note": "진입 신호 + 전용 리스크 규칙 + 시장 필터를 함께 정의합니다. 손절·익절은 전략이 강제하므로 폼의 고정% 설정을 덮어씁니다.",
+                "names": names(strategy::Generation::V2),
+            },
+        }),
+    );
     Ok(Json(Value::Object(out)))
 }
 
@@ -213,6 +228,7 @@ async fn filter_tradeable(
     watchlist: &[String],
     tf: Timeframe,
     risk: &RiskConfig,
+    max_hold_bars: usize,
 ) -> Result<(Vec<String>, Vec<String>), (StatusCode, String)> {
     // An auth failure must be surfaced, not swallowed: with an empty token every
     // fetch returns no candles, every symbol fails OOS, and the user sees a
@@ -226,7 +242,8 @@ async fn filter_tradeable(
         let sym_cfg = symbol_strats.get(code).unwrap_or(cfg);
         let sym_tf = symbol_strats.get(code).map(|c| c.recommended_tf()).unwrap_or(tf);
         let candles = st.fetcher.fetch(&token, code, sym_tf).await;
-        let oos = evaluate_strategy_live(&candles, sym_cfg, sym_tf, risk, &cost);
+        let mtf = MtfContext::build(&candles, sym_tf, risk.higher_tf_slope_tolerance);
+        let oos = evaluate_strategy_live(&candles, sym_cfg, sym_tf, risk, &cost, max_hold_bars, &mtf);
         if oos["tradeable"].as_bool().unwrap_or(false) {
             kept.push(code.clone());
         } else {
@@ -329,7 +346,9 @@ pub async fn start_engine(st: AppState, body: Value) -> ApiResult {
     // settings the engine will actually trade with (not the defaults).
     let mut dropped: Vec<String> = vec![];
     if body.get("require_tradeable").and_then(Value::as_bool).unwrap_or(false) {
-        let (kept, drop) = filter_tradeable(&st, &cfg, &symbol_strats, &watchlist, tf, &risk_cfg).await?;
+        // OOS 선별도 백테스트 화면과 같은 보유봉수 기준으로 판정한다 (기본 25).
+        let max_hold = body.get("max_hold_bars").and_then(Value::as_u64).unwrap_or(25) as usize;
+        let (kept, drop) = filter_tradeable(&st, &cfg, &symbol_strats, &watchlist, tf, &risk_cfg, max_hold).await?;
         watchlist = kept;
         dropped = drop;
         if watchlist.is_empty() {

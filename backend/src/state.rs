@@ -45,12 +45,16 @@ impl AppState {
     pub async fn token(&self) -> Result<String, (StatusCode, String)> {
         match self.ebest.auth_token(false).await {
             Some(t) if !t.is_empty() => Ok(t),
-            _ => Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "eBest 인증 실패 — 토큰을 발급할 수 없습니다. .env 의 \
-                 EBEST_APP_KEY/EBEST_APP_SECRET 와 네트워크를 확인하세요."
-                    .into(),
-            )),
+            // 게이트웨이가 알려준 실제 사유를 그대로 노출한다. 일반 문구만 띄우면
+            // 앱키 만료인지 네트워크 장애인지 로그를 봐야만 알 수 있었다.
+            _ => {
+                let why = self
+                    .ebest
+                    .last_auth_error()
+                    .await
+                    .unwrap_or_else(|| "원인 불명 — 백엔드 로그를 확인하세요.".into());
+                Err((StatusCode::SERVICE_UNAVAILABLE, format!("eBest 인증 실패 — {why}")))
+            }
         }
     }
 }

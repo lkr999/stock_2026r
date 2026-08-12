@@ -51,17 +51,6 @@ pub struct Fill {
 const LIMIT_FILL_POLLS: u32 = 5;
 const LIMIT_FILL_POLL_SECS: u64 = 3;
 
-/// Whether short-selling is executable at all, in *any* mode — the single
-/// switch every short-related gate reads (live orders, paper entries, and the
-/// backtester/OOS selection that ranks strategies before they ever trade).
-/// KR retail intraday short-selling is effectively unavailable, so this is
-/// `false` today; flip it here if the broker ever gains real support, and
-/// every gate that reads it (`Broker::supports_short`, `backtest.rs`)
-/// picks up the change automatically.
-pub fn shorting_supported() -> bool {
-    false
-}
-
 /// Routes orders to simulation (paper) or the eBest API (live).
 pub struct Broker {
     ebest: Option<Arc<EBestService>>,
@@ -79,43 +68,6 @@ impl Broker {
 
     pub async fn sell(&self, token: &str, code: &str, qty: i64, price: f64, order_type: &str) -> Fill {
         self.order(token, code, "sell", qty, price, order_type).await
-    }
-
-    /// Whether *new* short entries are executable. Delegates to the module-level
-    /// `shorting_supported()` so paper mirrors live instead of simulating a
-    /// trade nothing can actually place — the paper track record then only
-    /// reflects strategies live can execute.
-    pub fn supports_short(&self) -> bool {
-        shorting_supported()
-    }
-
-    /// Open a short. Rejected in every mode — see `supports_short`.
-    pub async fn sell_short(&self, _token: &str, code: &str, qty: i64, price: f64, _order_type: &str) -> Fill {
-        if !self.supports_short() {
-            tracing::warn!("[{}] short open unsupported — rejected ({code})", self.mode.as_str());
-            return Fill { ok: false, fill_price: price, qty: 0 };
-        }
-        if qty <= 0 {
-            return Fill { ok: false, fill_price: price, qty: 0 };
-        }
-        tracing::info!("[PAPER] SELL_SHORT {code} x{qty} @{price:.0}");
-        Fill { ok: true, fill_price: price, qty }
-    }
-
-    /// Cover (buy to close) a short. Unlike `sell_short`, this is *not* gated
-    /// by `supports_short` — a short position already open (e.g. from before
-    /// this policy took effect) must always be closeable, in paper the same
-    /// as live. Only opening new shorts is blocked.
-    pub async fn cover(&self, _token: &str, code: &str, qty: i64, price: f64, _order_type: &str) -> Fill {
-        if self.mode == TradingMode::Live {
-            tracing::warn!("[LIVE] short cover unsupported — rejected ({code})");
-            return Fill { ok: false, fill_price: price, qty: 0 };
-        }
-        if qty <= 0 {
-            return Fill { ok: false, fill_price: price, qty: 0 };
-        }
-        tracing::info!("[PAPER] COVER {code} x{qty} @{price:.0}");
-        Fill { ok: true, fill_price: price, qty }
     }
 
     async fn order(&self, token: &str, code: &str, side: &str, qty: i64, price: f64, order_type: &str) -> Fill {
@@ -191,15 +143,17 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn new_short_entries_are_rejected_in_every_mode() {
-        // Paper must now mirror live: neither can open a new short (only
-        // close an existing one via `cover`), so the paper track record only
-        // reflects strategies that are actually executable live.
-        for mode in [TradingMode::Paper, TradingMode::Live] {
-            let broker = Broker::new(None, mode);
-            assert!(!broker.supports_short());
-            let fill = broker.sell_short("", "005930", 10, 70_000.0, "limit").await;
-            assert!(!fill.ok, "sell_short should be rejected in {}", mode.as_str());
-        }
+    async fn paper_buy_and_sell_fill_instantly() {
+        let broker = Broker::new(None, TradingMode::Paper);
+        let buy = broker.buy("", "005930", 10, 70_000.0, "limit").await;
+        assert!(buy.ok && buy.qty == 10);
+        let sell = broker.sell("", "005930", 10, 71_000.0, "limit").await;
+        assert!(sell.ok && sell.qty == 10);
+    }
+
+    #[tokio::test]
+    async fn non_positive_qty_is_rejected() {
+        let broker = Broker::new(None, TradingMode::Paper);
+        assert!(!broker.buy("", "005930", 0, 70_000.0, "limit").await.ok);
     }
 }

@@ -96,17 +96,18 @@ pub fn rsi(candles: &[Candle], period: usize) -> Series {
     let deltas: Vec<f64> = c.windows(2).map(|w| w[1] - w[0]).collect();
     let gains: Vec<f64> = deltas.iter().map(|&d| if d > 0.0 { d } else { 0.0 }).collect();
     let losses: Vec<f64> = deltas.iter().map(|&d| if d < 0.0 { -d } else { 0.0 }).collect();
+    let value = |g: f64, l: f64| if l <= 1e-12 { 100.0 } else { 100.0 - 100.0 / (1.0 + g / l) };
+    // Wilder seed: the mean of the first `period` deltas *is* the value at bar
+    // `period`. Smoothing must therefore start at `period + 1` — folding
+    // `gains[period-1]` in again would double-count the seed's last delta and
+    // bias the whole series (it previously did).
     let mut avg_gain = gains[..period].iter().sum::<f64>() / period as f64;
     let mut avg_loss = losses[..period].iter().sum::<f64>() / period as f64;
-    for i in period..c.len() {
+    out[period] = Some(value(avg_gain, avg_loss));
+    for i in (period + 1)..c.len() {
         avg_gain = (avg_gain * (period as f64 - 1.0) + gains[i - 1]) / period as f64;
         avg_loss = (avg_loss * (period as f64 - 1.0) + losses[i - 1]) / period as f64;
-        out[i] = Some(if avg_loss <= 1e-12 {
-            100.0
-        } else {
-            let rs = avg_gain / avg_loss;
-            100.0 - 100.0 / (1.0 + rs)
-        });
+        out[i] = Some(value(avg_gain, avg_loss));
     }
     out
 }

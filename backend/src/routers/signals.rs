@@ -54,7 +54,7 @@ fn collect_signals(stock: &Stock, patterns: &[PatternResult], cfg: &StrategyConf
                     "shcode": stock.code,
                     "name": if stock.name.is_empty() { name_for(&stock.code) } else { stock.name.clone() },
                     "market": stock.market, "price": stock.price, "change_pct": stock.change_pct,
-                    "pattern_name": p.pattern_name, "pattern_type": p.pattern_type,
+                    "pattern_name": p.pattern_name,
                     "confidence": p.confidence, "composite_score": p.composite_score,
                     "atr_normalized": p.atr_normalized, "volume_confirmed": p.volume_confirmed,
                     "detected_at": p.detected_at, "expected_5": p.expected_5,
@@ -62,7 +62,7 @@ fn collect_signals(stock: &Stock, patterns: &[PatternResult], cfg: &StrategyConf
             } else {
                 json!({
                     "shcode": stock.code, "name": name_for(&stock.code),
-                    "pattern_name": p.pattern_name, "pattern_type": p.pattern_type,
+                    "pattern_name": p.pattern_name,
                     "confidence": p.confidence, "composite_score": p.composite_score,
                     "detected_at": p.detected_at,
                 })

@@ -15,8 +15,20 @@ export interface DashboardState {
   candidates: UniverseItem[];
   scanned: boolean;
   // 스텝 ② 백테스트
+  /** 검증할 전략 세대 — 'v2' | 'legacy' | 'all'(비교). */
+  btGeneration: 'v2' | 'legacy' | 'all';
   btTf: string;
   btHold: number;
+  /** 백테스트가 시뮬레이션할 고정 손절 %(0 = ATR 배수). 자동매매 폼과 같은 의미. */
+  btStopLossPct: number;
+  /** 백테스트가 시뮬레이션할 고정 익절 %(0 = ATR 배수). */
+  btTakeProfitPct: number;
+  /** 손절을 봉 마감이 아닌 실시간가로 판정할지 — OFF면 실거래의 손절 오버슛을 재현. */
+  btHardStopIntrabar: boolean;
+  /** 심층 조회 봉수 (0 = 타임프레임 기본 예산). */
+  btHistoryBars: number;
+  /** 익절 목표폭(%) — 종목별 권장 보유봉수 역산에 사용. */
+  btTargetPct: number;
   matrix: any;
   // 스텝 ③ OOS 선정 기준
   oosMinReturn: number;
@@ -26,6 +38,19 @@ export interface DashboardState {
   oosRankBy: string;
   oosMaxPick: number;
   oosSelectMsg: string;
+  /** 선정·배정에 사용할 전략 세대 (격자에 두 세대가 있어도 한 세대로만 배정). */
+  pickGeneration: 'v2' | 'legacy';
+  // 승률 중심 선정 기준
+  /** 최소 OOS 승률(%). */
+  oosMinWinRate: number;
+  /** 최소 승률 여유(%p) = 실제승률 − 손익분기승률. */
+  oosMinWinEdge: number;
+  /** 최소 손익비 (평균이익 ÷ 평균손실). */
+  oosMinPayoff: number;
+  /** 최소 IS→OOS 수익 유지율(%) — 과최적화 배제. */
+  oosMinRetention: number;
+  /** OOS 최악 폴드 낙폭 허용치(%, 0 = 제한없음). */
+  oosMaxMdd: number;
   // eBest 패널
   testCode: string;
   apiPanelOpen: boolean;
